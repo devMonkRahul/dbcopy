@@ -4,8 +4,9 @@ import uvicorn
 
 
 def main():
-    print("dbcopy dashboard -> http://127.0.0.1:8000")
-    uvicorn.run("app:app", host="127.0.0.1", port=8000)
+    print("dbcopy dashboard -> http://0.0.0.0:8000 (access from any network)")
+    print("                 -> http://localhost:8000 (local access)")
+    uvicorn.run("app:app", host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":

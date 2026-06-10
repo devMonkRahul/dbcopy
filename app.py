@@ -17,12 +17,22 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from dbcopy import core
 from dbcopy.adapters import get_adapter
 
 app = FastAPI(title="dbcopy", description="Database backup / restore / copy")
+
+# Enable CORS for all origins (needed when dashboard is accessed from different network/host)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---- in-memory job store ----------------------------------------------------
 
@@ -76,8 +86,6 @@ class CopyRequest(BaseModel):
 class TestRequest(BaseModel):
     url: str
 
-# Serve the static files (HTML Dashboard) on the root path
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 @app.post("/api/test")
 def test_connection(req: TestRequest):
@@ -85,14 +93,23 @@ def test_connection(req: TestRequest):
     Sync endpoint: FastAPI runs it in a threadpool, so it never blocks."""
     try:
         get_adapter(req.url).test_connection()
-    except (RuntimeError, ValueError) as exc:
+    except Exception as exc:
         message = str(exc)
+        # Add helpful hints for common errors
         if "timeout expired" in message or "timed out" in message.lower():
             message += (
                 "\nHint: the database server did not respond. For cloud "
                 "databases (e.g. AWS RDS): the instance must be publicly "
                 "accessible and its security group must allow your IP on "
                 "the database port."
+            )
+        elif "invalid" in message.lower() and "url" in message.lower():
+            message += (
+                "\nHint: connection string format should be:\n"
+                "  postgresql://user:password@host:5432/dbname\n"
+                "If password contains special chars, use percent encoding:\n"
+                "  $ → %24, @ → %40, # → %23, [ → %5B, ] → %5D, : → %3A\n"
+                "Example: myP@ss$word[123] → myP%40ss%24word%5B123%5D"
             )
         return {"ok": False, "error": message}
     return {"ok": True}
@@ -154,3 +171,8 @@ def job_status(job_id: str):
 def list_jobs():
     with _jobs_lock:
         return sorted(_jobs.values(), key=lambda j: j["started_at"], reverse=True)
+
+
+# Serve the static files (HTML Dashboard) on the root path LAST
+# to ensure API routes take precedence
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
