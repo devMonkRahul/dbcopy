@@ -16,7 +16,7 @@ import uuid
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from dbcopy import core
@@ -365,6 +365,7 @@ refreshJobs();
 </html>"""
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    return PAGE
+# @app.get("/", response_class=HTMLResponse)
+# def dashboard() -> str:
+#     return PAGE
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
