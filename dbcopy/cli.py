@@ -66,7 +66,14 @@ def _confirm(prompt: str) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    
+    # If no arguments provided, show help
+    if argv is None and len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+    
+    args = parser.parse_args(argv)
     try:
         if args.command == "backup":
             path = core.backup_database(args.url, args.output)
