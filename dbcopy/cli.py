@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import core
+from . import core, web
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the confirmation prompt",
     )
 
+    sub.add_parser("dashboard", help="Run the web dashboard to monitor copy jobs")
+
     return parser
 
 
@@ -88,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             core.clean_database(args.url)
             print("Database cleaned")
+
+        elif args.command == "dashboard":
+            web.run_dashboard()
+
         return 0
     except (RuntimeError, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
