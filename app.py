@@ -13,7 +13,8 @@ from __future__ import annotations
 import datetime
 import threading
 import uuid
-from urllib.parse import urlparse
+
+from urllib.parse import urlparse, quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -55,6 +56,37 @@ def _now() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL by percent-encoding special characters in credentials.
+    
+    Handles characters: $ → %24, @ → %40, # → %23, [ → %5B, ] → %5D, : → %3A
+    This allows users to paste URLs with unencoded special characters.
+    """
+    scheme_sep = "://"
+
+    if scheme_sep not in url:
+        raise ValueError("Invalid PostgreSQL URL")
+
+    scheme, remainder = url.split(scheme_sep, 1)
+
+    # Find the LAST @, which separates credentials from host
+    at_pos = remainder.rfind("@")
+    if at_pos == -1:
+        return url
+
+    credentials = remainder[:at_pos]
+    host_part = remainder[at_pos:]
+
+    if ":" not in credentials:
+        return url
+
+    username, password = credentials.split(":", 1)
+
+    encoded_password = quote(password, safe="")
+
+    return f"{scheme}://{username}:{encoded_password}{host_part}"
+
+
 def _run_copy(
     job_id: str, source_url: str, target_url: str,
     create_target: bool, overwrite: bool,
@@ -92,7 +124,8 @@ def test_connection(req: TestRequest):
     """Validate a connection string and try to reach the database.
     Sync endpoint: FastAPI runs it in a threadpool, so it never blocks."""
     try:
-        get_adapter(req.url).test_connection()
+        normalized_url = _normalize_url(req.url)
+        get_adapter(normalized_url).test_connection()
     except Exception as exc:
         message = str(exc)
         # Add helpful hints for common errors
@@ -120,7 +153,8 @@ def clean_database(req: TestRequest):
     """Remove ALL objects from the database. The UI confirms with the
     user before calling this; the endpoint itself does not ask twice."""
     try:
-        core.clean_database(req.url)
+        normalized_url = _normalize_url(req.url)
+        core.clean_database(normalized_url)
     except (RuntimeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True}
@@ -129,9 +163,13 @@ def clean_database(req: TestRequest):
 @app.post("/api/copy")
 def start_copy(req: CopyRequest):
     try:
+        # Normalize URLs to handle special characters in credentials
+        source_url = _normalize_url(req.source_url)
+        target_url = _normalize_url(req.target_url)
+        
         # Fail fast on bad URLs / cross-engine copies before spawning the job.
-        source = get_adapter(req.source_url)
-        target = get_adapter(req.target_url)
+        source = get_adapter(source_url)
+        target = get_adapter(target_url)
         if type(source) is not type(target):
             raise ValueError("Cross-database copy (e.g. Postgres -> MySQL) is not supported.")
     except ValueError as exc:
@@ -142,8 +180,8 @@ def start_copy(req: CopyRequest):
         _jobs[job_id] = {
             "id": job_id,
             "operation": "copy",
-            "source": _redact(req.source_url),
-            "target": _redact(req.target_url),
+            "source": _redact(source_url),
+            "target": _redact(target_url),
             "status": "pending",
             "error": None,
             "started_at": _now(),
@@ -151,7 +189,7 @@ def start_copy(req: CopyRequest):
         }
     threading.Thread(
         target=_run_copy,
-        args=(job_id, req.source_url, req.target_url,
+        args=(job_id, source_url, target_url,
               req.create_target, req.overwrite),
         daemon=True,
     ).start()

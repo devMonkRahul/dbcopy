@@ -95,7 +95,16 @@ class PostgresAdapter(DatabaseAdapter):
         ])
 
     def drop_database(self, name: str) -> None:
-        """Drop a database, kicking out any open connections (PG 13+)."""
+        """Drop a database, terminating any open connections first."""
+        # First, terminate all connections to the target database
+        self._run([
+            self._tool("psql"), *self._conn_args(database="postgres"), "--no-psqlrc",
+            "-c", f"""SELECT pg_terminate_backend(pg_stat_activity.pid)
+                      FROM pg_stat_activity
+                      WHERE pg_stat_activity.datname = '{name}' 
+                      AND pid <> pg_backend_pid()""",
+        ])
+        # Now drop the database (WITH FORCE for PG 13+)
         self._run([
             self._tool("psql"), *self._conn_args(database="postgres"), "--no-psqlrc",
             "-c", f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)',
