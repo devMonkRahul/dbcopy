@@ -24,7 +24,7 @@ import contextlib
 import os
 import subprocess
 import tempfile
-from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from .. import toolbox
 from .base import ConnectionInfo, DatabaseAdapter
@@ -72,8 +72,15 @@ class MongoAdapter(DatabaseAdapter):
         )
 
     def _uri(self) -> str:
-        """The connection URL with the password removed (it is supplied via a
-        ``--config`` file instead, so it never lands on the command line).
+        """A server connection URI (no database in the path) with the password
+        removed (it is supplied via a ``--config`` file instead, so it never
+        lands on the command line).
+
+        The database is dropped from the path on purpose: mongorestore treats a
+        database in the URI path as an implicit ``--db``, which silently
+        conflicts with the ``--nsFrom/--nsTo`` remap and restores 0 documents.
+        We always pass the database explicitly via ``--db`` (dump) or the ns
+        flags (restore) instead.
 
         Operates on the raw URL string so mongodb+srv and comma-separated seed
         lists survive untouched. Also injects a short serverSelectionTimeoutMS
@@ -85,10 +92,17 @@ class MongoAdapter(DatabaseAdapter):
         if sep:  # credentials present -> keep only the username
             user = creds.split(":", 1)[0]
             netloc = f"{user}@{hosts}" if user else hosts
-        query = parts.query
-        if "serverSelectionTimeoutMS" not in query:
-            query = (query + "&" if query else "") + "serverSelectionTimeoutMS=10000"
-        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+        params = parse_qsl(parts.query, keep_blank_values=True)
+        keys = {k.lower() for k, _ in params}
+        # An unspecified authSource defaults to the database in the path, which
+        # we are about to drop — pin it so authentication keeps working.
+        if self.info.user and "authsource" not in keys and self.info.database:
+            params.append(("authSource", self.info.database))
+        if "serverselectiontimeoutms" not in keys:
+            params.append(("serverSelectionTimeoutMS", "10000"))
+
+        return urlunsplit((parts.scheme, netloc, "/", urlencode(params), parts.fragment))
 
     @contextlib.contextmanager
     def _password_config(self):

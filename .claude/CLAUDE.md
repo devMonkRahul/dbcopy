@@ -92,6 +92,14 @@ downloads and caches portable binaries itself (see decision 10).
       through a temp `--config` file (decision 8). `serverSelectionTimeoutMS`
       is injected (setdefault) so unreachable hosts fail fast, like PG's
       `PGCONNECT_TIMEOUT`.
+    - **GOTCHA — `_uri()` drops the database from the path** and the code always
+      passes the db explicitly (`--db` for dump, `--nsFrom/--nsTo` for copy).
+      Reason: `mongorestore` treats a database in the URI path as an implicit
+      `--db`, which silently conflicts with `--nsFrom/--nsTo` and restores **0
+      documents while still exiting 0** (looks like "Copy complete" but copies
+      nothing). Do NOT put the database back in the `--uri`. Because an
+      unspecified `authSource` defaults to that path db, `_uri()` pins
+      `authSource=<db>` before dropping the path so auth keeps working.
     - **`overwrite`** uses `mongorestore --drop` — collection-level (drops
       each collection as it is restored), NOT a whole-database drop.
       `create_target` is effectively a no-op (Mongo creates DBs/collections
