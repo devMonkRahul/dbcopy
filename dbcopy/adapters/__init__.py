@@ -12,12 +12,13 @@ Adding MySQL later is just:
 from __future__ import annotations
 
 from .base import DatabaseAdapter
+from .mongo import MongoAdapter
 from .postgres import PostgresAdapter
 
 ADAPTERS: list[type[DatabaseAdapter]] = [
     PostgresAdapter,
+    MongoAdapter,
     # MySQLAdapter,   # future
-    # MongoAdapter,   # future
 ]
 
 

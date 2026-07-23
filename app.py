@@ -14,7 +14,7 @@ import datetime
 import threading
 import uuid
 
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -42,14 +42,18 @@ _jobs_lock = threading.Lock()
 
 
 def _redact(url: str) -> str:
-    """Connection string with the password hidden, for display/logs."""
-    parsed = urlparse(url)
-    if parsed.password:
-        netloc = f"{parsed.username}:****@{parsed.hostname}"
-        if parsed.port:
-            netloc += f":{parsed.port}"
-        return parsed._replace(netloc=netloc).geturl()
-    return url
+    """Connection string with the password hidden, for display/logs.
+
+    Works on the netloc directly (not urlparse().port) so MongoDB seed-list
+    URLs like h1:27017,h2:27017 — which would trip the integer port cast —
+    are handled too."""
+    parts = urlsplit(url)
+    creds, sep, hosts = parts.netloc.rpartition("@")
+    if not sep or ":" not in creds:
+        return url  # no credentials / no password to hide
+    user = creds.split(":", 1)[0]
+    netloc = f"{user}:****@{hosts}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _now() -> str:
@@ -65,7 +69,7 @@ def _normalize_url(url: str) -> str:
     scheme_sep = "://"
 
     if scheme_sep not in url:
-        raise ValueError("Invalid PostgreSQL URL")
+        raise ValueError("Invalid database URL")
 
     scheme, remainder = url.split(scheme_sep, 1)
 
@@ -140,6 +144,7 @@ def test_connection(req: TestRequest):
             message += (
                 "\nHint: connection string format should be:\n"
                 "  postgresql://user:password@host:5432/dbname\n"
+                "  mongodb://user:password@host:27017/dbname\n"
                 "If password contains special chars, use percent encoding:\n"
                 "  $ → %24, @ → %40, # → %23, [ → %5B, ] → %5D, : → %3A\n"
                 "Example: myP@ss$word[123] → myP%40ss%24word%5B123%5D"

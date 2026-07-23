@@ -4,6 +4,7 @@ Usage:
   python -m dbcopy backup  postgresql://user:pass@host:5432/mydb -o mydb.dump
   python -m dbcopy restore postgresql://user:pass@host:5432/mydb -i mydb.dump
   python -m dbcopy copy    postgresql://u:p@src:5432/proddb  postgresql://u:p@dst:5432/staging
+  python -m dbcopy copy    mongodb://u:p@src:27017/proddb    mongodb://u:p@dst:27017/staging
 """
 
 from __future__ import annotations
@@ -17,12 +18,16 @@ from . import core, web
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dbcopy",
-        description="Backup, restore, and copy databases (PostgreSQL today, more later).",
+        description="Backup, restore, and copy databases (PostgreSQL and MongoDB).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_backup = sub.add_parser("backup", help="Dump a database to a file")
-    p_backup.add_argument("url", help="Database URL, e.g. postgresql://user:pass@host:5432/db")
+    p_backup.add_argument(
+        "url",
+        help="Database URL, e.g. postgresql://user:pass@host:5432/db "
+             "or mongodb://user:pass@host:27017/db",
+    )
     p_backup.add_argument("-o", "--output", help="Output file (default: <db>_<timestamp>.dump)")
 
     p_restore = sub.add_parser("restore", help="Restore a dump file into a database")

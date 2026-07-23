@@ -3,9 +3,9 @@
 ## What this project is
 
 A Python tool to backup, restore, and make a full copy of a database from a
-source to a target, with a CLI and a FastAPI web dashboard. PostgreSQL is
-supported today; the architecture is designed so MySQL, MongoDB, etc. can be
-added later without touching core code. **The tool is self-sufficient: it
+source to a target, with a CLI and a FastAPI web dashboard. PostgreSQL and
+MongoDB are supported today; the architecture is designed so MySQL, etc. can
+be added later without touching core code. **The tool is self-sufficient: it
 does not require any database client tools to be installed locally** — it
 downloads and caches portable binaries itself (see decision 10).
 
@@ -38,21 +38,36 @@ downloads and caches portable binaries itself (see decision 10).
    compressed and restorable with `pg_restore` (selective restore possible).
 7. **Dumps use `--no-owner --no-acl`** so they restore cleanly under a
    different role on the target.
-8. **Passwords go through the `PGPASSWORD` env var** in subprocesses —
-   never on the command line (would leak in `ps` / shell history).
+8. **Passwords never go on the command line** (would leak in `ps` / shell
+   history). Postgres uses the `PGPASSWORD` env var; MongoDB has no env-var
+   equivalent, so the Mongo adapter writes the password to a temporary
+   `--config` YAML file (mode 0600, deleted after) — see decision 13.
 9. **Cross-engine copy (Postgres -> MySQL) is intentionally unsupported**;
    `core.copy_database` raises ValueError if adapter types differ.
-10. **Self-managed client tools** (`dbcopy/toolbox.py`). `find_tool(name)`
-    resolves each tool in this order: `DBCOPY_PG_BIN` env dir → managed
-    cache `~/.dbcopy/tools/postgresql-<ver>/bin` → system PATH →
-    auto-download from GitHub `theseus-rs/postgresql-binaries` (release
-    asset `postgresql-{ver}-{rust-target-triple}.tar.gz`, SHA-256 verified,
-    extracted atomically via temp dir + move). Pinned version in
-    `DEFAULT_PG_VERSION` (18.4.0), overridable with `DBCOPY_PG_VERSION`;
-    cache root overridable with `DBCOPY_HOME`. Newer pg_dump can dump
-    servers back to PG 9.2, so one client version covers everything.
-    Gotcha: the published `.sha256` files are in Windows CertUtil multi-line
-    format, not `hash  filename` — parse by regexing the first 64-hex token.
+10. **Self-managed client tools** (`dbcopy/toolbox.py`). Organized as a
+    `_ToolFamily` registry (`_PG`, `_MONGO_TOOLS`) so each engine's
+    version/platform/download differences live in one descriptor; the public
+    API `find_tool(name)` / `ensure_tools(names)` is unchanged and routes by
+    tool name via `_family_for_tool`. `find_tool(name)` resolves in this
+    order: family override env dir (`DBCOPY_PG_BIN` / `DBCOPY_MONGO_BIN`) →
+    managed cache `~/.dbcopy/tools/<dirname>-<ver>/bin` → system PATH →
+    auto-download (SHA-256 verified best-effort, extracted atomically via
+    temp dir + move). Cache root overridable with `DBCOPY_HOME`.
+    - **Postgres**: GitHub `theseus-rs/postgresql-binaries`, asset
+      `postgresql-{ver}-{rust-target-triple}.tar.gz`, pinned
+      `DEFAULT_PG_VERSION` (18.4.0), override `DBCOPY_PG_VERSION`. Newer
+      pg_dump dumps servers back to PG 9.2, so one client version covers all.
+    - **MongoDB**: `fastdl.mongodb.org/tools/db`, asset
+      `mongodb-database-tools-{token}-{ver}.{zip|tgz}` (`.zip` on
+      Windows/macOS, `.tgz` on Linux — extraction branches on this; zip
+      restores the exec bit on POSIX). Token is OS/distro-based
+      (`windows-x86_64`, `macos-arm64`, `ubuntu2204-x86_64`, ...), NOT a rust
+      triple; no universal Linux build, so the distro defaults to
+      `ubuntu2204` and is overridable with `DBCOPY_MONGO_PLATFORM`. Pinned
+      `DEFAULT_MONGO_TOOLS_VERSION`, override `DBCOPY_MONGO_VERSION`.
+    Gotcha: the published `.sha256` files can be Windows CertUtil multi-line
+    format, not `hash  filename` — parse by regexing the first 64-hex token
+    (and verification silently skips if no sidecar is served).
 11. **Web jobs never block the request.** `app.py` starts copies in a
     daemon `threading.Thread`, stores state in an in-memory dict guarded by
     a lock, and exposes `GET /api/jobs/{id}` for polling. Blocking endpoints
@@ -65,6 +80,30 @@ downloads and caches portable binaries itself (see decision 10).
     The CLI prompts (`clean` asks y/N unless `-y`); the UI uses JS
     `confirm()` for both the Clean button and the overwrite checkbox.
     `app.py`'s `/api/clean` and `overwrite` field trust the caller.
+13. **MongoDB adapter** (`dbcopy/adapters/mongo.py`, schemes `mongodb` /
+    `mongodb+srv`, default port 27017) wraps the MongoDB Database Tools:
+    `backup` → `mongodump --archive=<file> --gzip`; `restore` →
+    `mongorestore --archive=<file> --gzip [--drop if clean]`; `copy` →
+    `mongodump --archive | mongorestore --archive` streamed with the exact
+    SIGPIPE / no-`communicate()` pattern as Postgres (decision 5).
+    - **Connection** is passed as `--uri` with the password *stripped from the
+      URL string* (via `urlsplit`/`urlunsplit`, so `mongodb+srv`, comma seed
+      lists and query options survive). The password is supplied separately
+      through a temp `--config` file (decision 8). `serverSelectionTimeoutMS`
+      is injected (setdefault) so unreachable hosts fail fast, like PG's
+      `PGCONNECT_TIMEOUT`.
+    - **`overwrite`** uses `mongorestore --drop` — collection-level (drops
+      each collection as it is restored), NOT a whole-database drop.
+      `create_target` is effectively a no-op (Mongo creates DBs/collections
+      implicitly on first write).
+    - **`copy` remaps** the dumped db into the target db name with
+      `--nsFrom <src>.* --nsTo <tgt>.*` (equal single wildcards — a `*.*`→`X.*`
+      remap is illegal, the wildcard counts must match). `restore` does NOT
+      remap (it doesn't know the archive's source db), so it restores the
+      namespaces the archive carries.
+    - **`clean` is intentionally unsupported** for MongoDB: wiping a database
+      needs `mongosh`, which is deliberately not bundled. It raises a clear
+      RuntimeError pointing at `copy --overwrite`.
 
 ## Project layout
 
@@ -73,9 +112,10 @@ dbcopy/
 ├── adapters/
 │   ├── base.py       # DatabaseAdapter ABC + ConnectionInfo dataclass
 │   ├── postgres.py   # PostgresAdapter
+│   ├── mongo.py      # MongoAdapter (mongodump / mongorestore)
 │   └── __init__.py   # ADAPTERS registry + get_adapter(url)
 ├── core.py           # backup_database / restore_database / copy_database
-├── toolbox.py        # self-managed client tools (download/cache/resolve)
+├── toolbox.py        # self-managed client tools (_ToolFamily registry)
 ├── cli.py            # argparse CLI: backup | restore | copy
 └── __main__.py       # enables `python -m dbcopy`
 app.py                # FastAPI dashboard (HTML inline) + job API
@@ -86,22 +126,27 @@ main.py               # `python main.py` -> uvicorn on 127.0.0.1:8000
 
 ```bash
 python -m dbcopy copy    postgresql://u:p@src:5432/proddb postgresql://u:p@dst:5432/staging [--overwrite]
+python -m dbcopy copy    mongodb://u:p@src:27017/proddb   mongodb://u:p@dst:27017/staging [--overwrite]
 python -m dbcopy backup  postgresql://u:p@host:5432/mydb -o mydb.dump
 python -m dbcopy restore postgresql://u:p@host:5432/newdb -i mydb.dump [--clean]
-python -m dbcopy clean   postgresql://u:p@host:5432/mydb [-y]   # removes ALL objects
+python -m dbcopy clean   postgresql://u:p@host:5432/mydb [-y]   # removes ALL objects (Postgres only)
 uv run python main.py    # dashboard at http://127.0.0.1:8000
 ```
 
-`copy --overwrite` drops + recreates the target DB first (for non-empty
-targets, which otherwise fail fast with a clear "already exists" hint).
+`copy --overwrite` drops + recreates the target DB first for Postgres (for
+non-empty targets, which otherwise fail fast with a clear "already exists"
+hint); for MongoDB it means `mongorestore --drop` (collection-level).
+Cross-engine copy (e.g. Postgres ↔ MongoDB) is rejected (decision 9).
 
-URL format: `postgresql://user:password@host:port/dbname`
-(schemes `postgresql` and `postgres` both accepted). Credentials are
-percent-decoded (`p%40ss` -> `p@ss`); query params land in
-`ConnectionInfo.options` (`?sslmode=require` -> PGSSLMODE). The adapter
-sets `PGCONNECT_TIMEOUT=10` (setdefault, so a user-set env var wins) —
-without it, psql to a firewalled host (typical RDS misconfig) hangs for
-minutes and the dashboard fetch dies with browser "Failed to fetch".
+URL format: `postgresql://user:password@host:port/dbname` (schemes
+`postgresql`/`postgres`) or `mongodb://...` / `mongodb+srv://...` (port
+defaults to 27017). Credentials are percent-decoded (`p%40ss` -> `p@ss`);
+query params land in `ConnectionInfo.options` (Postgres `?sslmode=require`
+-> PGSSLMODE; Mongo query options are carried through in the `--uri`). The
+Postgres adapter sets `PGCONNECT_TIMEOUT=10` (setdefault, so a user-set env
+var wins) and the Mongo adapter injects `serverSelectionTimeoutMS=10000` —
+without these, connecting to a firewalled host (typical RDS misconfig) hangs
+for minutes and the dashboard fetch dies with browser "Failed to fetch".
 `/api/test` appends an RDS hint (public accessibility + security group)
 when the error is a timeout.
 
@@ -132,8 +177,9 @@ target_url, create_target, overwrite}, `POST /api/clean` {url},
 ## Roadmap / next steps (owner's stated intent)
 
 1. **MySQL adapter**: `dbcopy/adapters/mysql.py`, `schemes = ("mysql",)`,
-   wrap `mysqldump` / `mysql`; append to `ADAPTERS` list. Extend
-   `toolbox.py` if self-managed MySQL client binaries are wanted.
+   wrap `mysqldump` / `mysql`; append to `ADAPTERS` list. For self-managed
+   binaries add a third `_ToolFamily` in `toolbox.py` (the Mongo entry is the
+   template for a non-theseus download source / zip archive).
 2. **Dashboard enhancements**: backup/restore operations in the UI,
    persistent job history, progress percentage (needs `pg_dump --verbose`
    parsing or table counts).
