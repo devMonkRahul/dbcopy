@@ -35,6 +35,11 @@ class MongoAdapter(DatabaseAdapter):
 
     DEFAULT_PORT = 27017
     REQUIRED_TOOLS = ("mongodump", "mongorestore")
+    #: Hard wall-clock cap (seconds) for connection-establishing commands.
+    #: mongodump does NOT reliably honor serverSelectionTimeoutMS for an
+    #: unreachable (firewalled / IP-not-allowlisted) host — it hangs — so we
+    #: enforce our own timeout, otherwise the web request never returns.
+    CONNECT_TIMEOUT = 20
 
     # ---- helpers ---------------------------------------------------------
 
@@ -145,8 +150,22 @@ class MongoAdapter(DatabaseAdapter):
     def _tool(name: str) -> str:
         return toolbox.find_tool(name)
 
-    def _run(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-        result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    def _run(
+        self, cmd: list[str], *, timeout: float | None = None, **kwargs
+    ) -> subprocess.CompletedProcess:
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, **kwargs
+            )
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run kills the child before re-raising.
+            raise RuntimeError(
+                f"Timed out after {int(timeout)}s connecting with "
+                f"{os.path.basename(cmd[0])}. The server did not respond — check "
+                "the host/port and that it is reachable from here (firewall / "
+                "VPN), and for hosted databases (e.g. MongoDB Atlas) that your "
+                "current IP is on the access list."
+            ) from exc
         if result.returncode != 0:
             raise RuntimeError(
                 f"Command failed: {' '.join(cmd[:1])} ...\n{result.stderr.strip()}"
@@ -164,7 +183,7 @@ class MongoAdapter(DatabaseAdapter):
                 "--collection", "__dbcopy_conn_probe__",
                 "--out", tmp,
                 "--quiet",
-            ])
+            ], timeout=self.CONNECT_TIMEOUT)
 
     def clean_database(self) -> None:
         raise RuntimeError(
@@ -195,6 +214,7 @@ class MongoAdapter(DatabaseAdapter):
         self.check_tools()
         if not os.path.exists(input_path):
             raise FileNotFoundError(input_path)
+        self.test_connection()  # bounded — fail fast if the host is unreachable
         with self._password_config() as cfg:
             cmd = [
                 self._tool("mongorestore"), *self._conn_args(), *cfg,
@@ -222,6 +242,11 @@ class MongoAdapter(DatabaseAdapter):
         -database drop; that would need mongosh)."""
         self.check_tools()
         target.check_tools()
+        # Verify BOTH endpoints are reachable (bounded) before starting the
+        # long-running pipe — otherwise an unreachable host makes mongodump /
+        # mongorestore hang forever (they ignore serverSelectionTimeoutMS).
+        self.test_connection()
+        target.test_connection()
 
         src_db = self.info.database
         tgt_db = target.info.database

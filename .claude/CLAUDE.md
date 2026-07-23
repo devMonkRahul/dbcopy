@@ -90,8 +90,15 @@ downloads and caches portable binaries itself (see decision 10).
       URL string* (via `urlsplit`/`urlunsplit`, so `mongodb+srv`, comma seed
       lists and query options survive). The password is supplied separately
       through a temp `--config` file (decision 8). `serverSelectionTimeoutMS`
-      is injected (setdefault) so unreachable hosts fail fast, like PG's
-      `PGCONNECT_TIMEOUT`.
+      is injected (setdefault), BUT — GOTCHA — mongodump/mongorestore do NOT
+      honor it for an unreachable (firewalled / IP-not-allowlisted) host: they
+      hang indefinitely (verified). So the adapter enforces its OWN hard
+      `subprocess` timeout (`CONNECT_TIMEOUT`, 20s) on every connection-
+      establishing command via `_run(..., timeout=...)`; without it the web
+      request never returns. `test_connection` is bounded, and `copy_to`
+      pre-flights `test_connection()` on BOTH endpoints before the (unbounded,
+      possibly long) data pipe so an unreachable host fails fast instead of
+      hanging. The timeout error text triggers the existing `/api/test` hint.
     - **GOTCHA — `_uri()` drops the database from the path** and the code always
       passes the db explicitly (`--db` for dump, `--nsFrom/--nsTo` for copy).
       Reason: `mongorestore` treats a database in the URI path as an implicit
