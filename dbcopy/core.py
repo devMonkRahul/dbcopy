@@ -29,18 +29,37 @@ def restore_database(url: str, input_path: str, *, clean: bool = False) -> None:
     adapter.restore(input_path, clean=clean)
 
 
+def _count_objects(adapter) -> int | None:
+    """Object count for reporting, or None if it cannot be determined.
+
+    Deliberately swallows errors: this runs after a copy has already
+    succeeded, so a failure to *describe* the result must not turn a good
+    copy into a reported failure.
+    """
+    try:
+        return adapter.object_count()
+    except Exception:
+        return None
+
+
 def copy_database(
     source_url: str,
     target_url: str,
     *,
     create_target: bool = True,
     overwrite: bool = False,
-) -> None:
+    skip_missing_extensions: bool = False,
+) -> dict:
     """Full live copy of source -> target (streamed, no temp file).
 
     Source and target must currently be the same database type.
     With overwrite=True the target database is dropped and recreated
     before copying (destructive).
+
+    Returns a summary of what was copied — object counts (None if the
+    adapter cannot tell) plus where the data landed — so callers can say
+    more than "done" and a copy that moved nothing is never reported as a
+    plain success.
     """
     source = get_adapter(source_url)
     target = get_adapter(target_url)
@@ -49,7 +68,18 @@ def copy_database(
             "Cross-database copy (e.g. Postgres -> MySQL) is not supported."
         )
     source.test_connection()
-    source.copy_to(target, create_target=create_target, overwrite=overwrite)
+    source.copy_to(
+        target,
+        create_target=create_target,
+        overwrite=overwrite,
+        skip_missing_extensions=skip_missing_extensions,
+    )
+    return {
+        "source_objects": _count_objects(source),
+        "target_objects": _count_objects(target),
+        "target_database": target.info.database,
+        "target_endpoint": f"{target.info.host}:{target.info.port}",
+    }
 
 
 def clean_database(url: str) -> None:

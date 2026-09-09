@@ -185,6 +185,10 @@ class MongoAdapter(DatabaseAdapter):
                 "--quiet",
             ], timeout=self.CONNECT_TIMEOUT)
 
+    # object_count() is left at the base implementation (None): counting
+    # collections needs a query tool, and dbcopy deliberately does not bundle
+    # mongosh. mongodump/mongorestore report their own progress on stderr.
+
     def clean_database(self) -> None:
         raise RuntimeError(
             "clean is not supported for MongoDB: wiping a database requires "
@@ -231,6 +235,7 @@ class MongoAdapter(DatabaseAdapter):
         *,
         create_target: bool = True,
         overwrite: bool = False,
+        skip_missing_extensions: bool = False,  # no Mongo equivalent; ignored
     ) -> None:
         """Stream source -> target with no intermediate file:
         mongodump --archive | mongorestore --archive (on the target).

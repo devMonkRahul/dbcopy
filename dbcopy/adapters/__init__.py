@@ -3,22 +3,23 @@
 get_adapter() picks the right adapter from the URL scheme, so the rest
 of the code never needs to know which database it is talking to.
 
-Adding MySQL later is just:
+Adding another engine is just:
 
-    from .mysql import MySQLAdapter
-    ADAPTERS.append(MySQLAdapter)
+    from .oracle import OracleAdapter
+    ADAPTERS.append(OracleAdapter)
 """
 
 from __future__ import annotations
 
 from .base import DatabaseAdapter
 from .mongo import MongoAdapter
+from .mysql import MySQLAdapter
 from .postgres import PostgresAdapter
 
 ADAPTERS: list[type[DatabaseAdapter]] = [
     PostgresAdapter,
     MongoAdapter,
-    # MySQLAdapter,   # future
+    MySQLAdapter,
 ]
 
 

@@ -5,6 +5,12 @@ Wraps the battle-tested native tools instead of reimplementing them:
   - restore -> pg_restore
   - copy    -> pg_dump --format=plain piped straight into psql on the
                target (no intermediate file, works across servers)
+
+pg_dump is always run at a version matching the server being dumped, not at
+whatever version happens to be bundled: pg_dump writes SQL for its own
+version, and a newer client emits statements an older server rejects (PG 17
+added `transaction_timeout`, which PG 16 and older refuse outright). psql is
+version-agnostic — it only ships the SQL — so it stays on the default build.
 """
 
 from __future__ import annotations
@@ -21,6 +27,11 @@ class PostgresAdapter(DatabaseAdapter):
 
     DEFAULT_PORT = 5432
     REQUIRED_TOOLS = ("pg_dump", "pg_restore", "psql")
+    #: Memoized server major version (see server_major_version).
+    _server_major: int | None = None
+    #: First pg_dump major version with --exclude-extension (16 has only the
+    #: include-form --extension, which cannot express "everything but these").
+    EXCLUDE_EXTENSION_MIN_MAJOR = 17
 
     # ---- helpers ---------------------------------------------------------
 
@@ -53,9 +64,14 @@ class PostgresAdapter(DatabaseAdapter):
 
     def check_tools(self) -> None:
         """Resolve the client tools, auto-downloading portable binaries on
-        first use — no local PostgreSQL installation is required."""
+        first use — no local PostgreSQL installation is required.
+
+        Only psql is fetched here. It is version-agnostic (libpq talks to any
+        server) and is what we use to ask the server which pg_dump version it
+        needs; the matching pg_dump/pg_restore are provisioned lazily by
+        _versioned_tool once that answer is known."""
         try:
-            toolbox.ensure_tools(self.REQUIRED_TOOLS)
+            toolbox.ensure_tools(("psql",))
         except RuntimeError:
             raise
         except Exception as exc:
@@ -65,7 +81,59 @@ class PostgresAdapter(DatabaseAdapter):
 
     @staticmethod
     def _tool(name: str) -> str:
+        """A version-agnostic tool (psql) from the default bundle."""
         return toolbox.find_tool(name)
+
+    def _server_query(self, sql: str) -> str:
+        """Run a server-wide query without assuming this adapter's database
+        exists yet.
+
+        Tries this adapter's own database, then the always-present `postgres`
+        maintenance database: copy_to has to interrogate the TARGET server
+        (version, available extensions) before the target database has been
+        created."""
+        candidates = [self.info.database]
+        if "postgres" not in candidates:
+            candidates.append("postgres")
+        failure: Exception | None = None
+        for database in candidates:
+            try:
+                return self._run([
+                    self._tool("psql"), *self._conn_args(database=database),
+                    "--no-psqlrc", "-tAc", sql,
+                ]).stdout
+            except RuntimeError as exc:
+                failure = exc
+        raise failure
+
+    def server_major_version(self) -> int:
+        """Major version of the server this adapter points at, e.g. 16."""
+        if self._server_major is None:
+            # server_version_num is e.g. 160015 for 16.15.
+            out = self._server_query("SHOW server_version_num").strip()
+            self._server_major = int(out) // 10000
+        return self._server_major
+
+    def installed_extensions(self) -> set[str]:
+        """Extensions actually installed in THIS database."""
+        out = self._run([
+            self._tool("psql"), *self._conn_args(), "--no-psqlrc", "-tAc",
+            "SELECT extname FROM pg_extension",
+        ]).stdout
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def available_extensions(self) -> set[str]:
+        """Extensions this SERVER could install — i.e. whose control files are
+        present on the machine running PostgreSQL. Server-wide, so it is
+        readable before the target database exists."""
+        out = self._server_query("SELECT name FROM pg_available_extensions")
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def _versioned_tool(self, name: str, major: int | None = None) -> str:
+        """pg_dump / pg_restore built for a given server major version
+        (this adapter's own server by default)."""
+        version = toolbox.pg_version_for_major(major or self.server_major_version())
+        return toolbox.find_tool(name, version=version)
 
     def _run(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         result = subprocess.run(
@@ -110,6 +178,15 @@ class PostgresAdapter(DatabaseAdapter):
             "-c", f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)',
         ])
 
+    def object_count(self) -> int:
+        """Number of user tables and views, across every non-system schema."""
+        result = self._run([
+            self._tool("psql"), *self._conn_args(), "--no-psqlrc", "-tAc",
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')",
+        ])
+        return int(result.stdout.strip() or 0)
+
     def clean_database(self) -> None:
         """Drop every user schema CASCADE (removes all tables, views,
         sequences, functions, ...), then recreate an empty `public`."""
@@ -136,7 +213,7 @@ class PostgresAdapter(DatabaseAdapter):
         """Full dump in custom format (compressed, restorable selectively)."""
         self.check_tools()
         self._run([
-            self._tool("pg_dump"), *self._conn_args(),
+            self._versioned_tool("pg_dump"), *self._conn_args(),
             "--format=custom",
             "--no-owner", "--no-acl",
             "--file", output_path,
@@ -151,7 +228,7 @@ class PostgresAdapter(DatabaseAdapter):
         if not self.database_exists(self.info.database):
             self.create_database(self.info.database)
         cmd = [
-            self._tool("pg_restore"), *self._conn_args(),
+            self._versioned_tool("pg_restore"), *self._conn_args(),
             "--no-owner", "--no-acl",
         ]
         if clean:
@@ -165,11 +242,58 @@ class PostgresAdapter(DatabaseAdapter):
         *,
         create_target: bool = True,
         overwrite: bool = False,
+        skip_missing_extensions: bool = False,
     ) -> None:
         """Stream source -> target with no intermediate file:
         pg_dump --format=plain | psql (on the target)."""
         self.check_tools()
         target.check_tools()
+
+        # A dump is only loadable into a server at least as new as the client
+        # that wrote it, and pg_dump refuses to read a server newer than
+        # itself — so a downgrade has no valid client version and cannot work.
+        source_major = self.server_major_version()
+        target_major = target.server_major_version()
+        if source_major > target_major:
+            raise RuntimeError(
+                f"Cannot copy PostgreSQL {source_major} -> PostgreSQL "
+                f"{target_major}: pg_dump cannot produce a dump that an older "
+                "server accepts. Upgrade the target server to at least "
+                f"{source_major}, or migrate the schema by hand."
+            )
+
+        # A dump recreates the source's extensions with CREATE EXTENSION, which
+        # fails outright when the package is not installed on the target
+        # machine (common when copying out of a managed Postgres such as
+        # Supabase or RDS). Check every extension up front rather than dying
+        # part-way through on whichever one pg_dump happens to emit first.
+        missing = sorted(self.installed_extensions() - target.available_extensions())
+        exclude_extensions: list[str] = []
+        if missing:
+            if not skip_missing_extensions:
+                raise RuntimeError(
+                    "The source database uses PostgreSQL extensions that the "
+                    f"target server does not have available:\n  {', '.join(missing)}\n"
+                    "Install them on the target (the extension files must exist "
+                    "on the server itself, not just be enabled), or re-run with "
+                    "--skip-missing-extensions to copy without them. Skipping is "
+                    "lossy: any table or function that depends on one of these "
+                    "will fail to copy."
+                )
+            exclude_extensions = missing
+
+        dump_major = source_major
+        if exclude_extensions and dump_major < self.EXCLUDE_EXTENSION_MIN_MAJOR:
+            # --exclude-extension only exists in pg_dump 17+. A newer client is
+            # allowed as long as the target can still read what it writes.
+            if target_major < self.EXCLUDE_EXTENSION_MIN_MAJOR:
+                raise RuntimeError(
+                    "Skipping extensions needs pg_dump "
+                    f"{self.EXCLUDE_EXTENSION_MIN_MAJOR}+, whose output a "
+                    f"PostgreSQL {target_major} target rejects. Install these "
+                    f"extensions on the target instead: {', '.join(exclude_extensions)}."
+                )
+            dump_major = self.EXCLUDE_EXTENSION_MIN_MAJOR
 
         if overwrite:
             target.drop_database(target.info.database)
@@ -178,12 +302,16 @@ class PostgresAdapter(DatabaseAdapter):
             target.create_database(target.info.database)
 
         dump_cmd = [
-            self._tool("pg_dump"), *self._conn_args(),
+            # Matched to the SOURCE server: it must be new enough to read it,
+            # and the check above guarantees the target is no older.
+            self._versioned_tool("pg_dump", dump_major), *self._conn_args(),
             "--format=plain",
             "--no-owner", "--no-acl",
         ]
+        for extension in exclude_extensions:
+            dump_cmd.append(f"--exclude-extension={extension}")
         restore_cmd = [
-            self._tool("psql"), *target._conn_args(), "--no-psqlrc",
+            target._tool("psql"), *target._conn_args(), "--no-psqlrc",
             "--set", "ON_ERROR_STOP=on",
             "--quiet",
         ]
@@ -208,7 +336,13 @@ class PostgresAdapter(DatabaseAdapter):
         # Check the restore side first: when psql dies mid-stream, pg_dump
         # only sees a broken pipe — psql's stderr holds the root cause.
         if restore.returncode != 0:
-            message = restore_err.decode().strip()
+            message = restore_err.decode(errors="replace").strip()
+            if "is not available" in message and "extension" in message:
+                message += (
+                    "\nHint: the target server does not have this extension "
+                    "installed. Install it there, or re-run with "
+                    "--skip-missing-extensions."
+                )
             if "already exists" in message:
                 message += (
                     "\nHint: the target database already contains objects. "
@@ -217,4 +351,6 @@ class PostgresAdapter(DatabaseAdapter):
                 )
             raise RuntimeError(f"restore failed:\n{message}")
         if dump.returncode != 0:
-            raise RuntimeError(f"pg_dump failed:\n{dump_err.decode().strip()}")
+            raise RuntimeError(
+                f"pg_dump failed:\n{dump_err.decode(errors='replace').strip()}"
+            )

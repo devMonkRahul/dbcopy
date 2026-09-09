@@ -5,6 +5,7 @@ Usage:
   python -m dbcopy restore postgresql://user:pass@host:5432/mydb -i mydb.dump
   python -m dbcopy copy    postgresql://u:p@src:5432/proddb  postgresql://u:p@dst:5432/staging
   python -m dbcopy copy    mongodb://u:p@src:27017/proddb    mongodb://u:p@dst:27017/staging
+  python -m dbcopy copy    mysql://u:p@src:3306/proddb       mysql://u:p@dst:3306/staging
 """
 
 from __future__ import annotations
@@ -18,14 +19,16 @@ from . import core, web
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dbcopy",
-        description="Backup, restore, and copy databases (PostgreSQL and MongoDB).",
+        description="Backup, restore, and copy databases "
+                    "(PostgreSQL, MySQL and MongoDB).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_backup = sub.add_parser("backup", help="Dump a database to a file")
     p_backup.add_argument(
         "url",
-        help="Database URL, e.g. postgresql://user:pass@host:5432/db "
+        help="Database URL, e.g. postgresql://user:pass@host:5432/db, "
+             "mysql://user:pass@host:3306/db "
              "or mongodb://user:pass@host:27017/db",
     )
     p_backup.add_argument("-o", "--output", help="Output file (default: <db>_<timestamp>.dump)")
@@ -46,13 +49,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not auto-create the target database if it is missing",
     )
     p_copy.add_argument(
+        "--skip-missing-extensions", action="store_true",
+        help="PostgreSQL: copy without the extensions the target server does "
+             "not have installed, instead of failing (lossy — objects that "
+             "depend on them will not copy)",
+    )
+    p_copy.add_argument(
         "--overwrite", action="store_true",
         help="DROP and recreate the target database before copying "
              "(use when the target already contains objects)",
     )
 
     p_clean = sub.add_parser(
-        "clean", help="Remove ALL tables and objects from a database (destructive)",
+        "clean",
+        help="Remove ALL tables and objects from a database (destructive; "
+             "PostgreSQL and MySQL only)",
     )
     p_clean.add_argument("url", help="Database URL to clean")
     p_clean.add_argument(
@@ -63,6 +74,26 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dashboard", help="Run the web dashboard to monitor copy jobs")
 
     return parser
+
+
+def _copy_summary(summary: dict) -> str:
+    """Human-readable outcome of a copy.
+
+    Always names the database the data actually landed in and how much of it
+    arrived: a copy that silently moved nothing (wrong database name in the
+    source URL) otherwise looks exactly like a successful one.
+    """
+    target = f'"{summary["target_database"]}" at {summary["target_endpoint"]}'
+    if summary["source_objects"] == 0:
+        return (
+            "Copy complete, but nothing was copied: the source database "
+            "contains no tables. Check the database name in the source URL."
+        )
+    count = summary["target_objects"]
+    if count is None:
+        return f"Copy complete into {target}"
+    noun = "table/view" if count == 1 else "tables/views"
+    return f"Copy complete: {target} now holds {count} {noun}"
 
 
 def _confirm(prompt: str) -> bool:
@@ -87,12 +118,13 @@ def main(argv: list[str] | None = None) -> int:
             core.restore_database(args.url, args.input, clean=args.clean)
             print("Restore complete")
         elif args.command == "copy":
-            core.copy_database(
+            summary = core.copy_database(
                 args.source_url, args.target_url,
                 create_target=not args.no_create,
                 overwrite=args.overwrite,
+                skip_missing_extensions=args.skip_missing_extensions,
             )
-            print("Copy complete")
+            print(_copy_summary(summary))
         elif args.command == "clean":
             if not args.yes and not _confirm(
                 "This will permanently DELETE ALL tables and objects in the "

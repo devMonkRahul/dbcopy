@@ -86,11 +86,25 @@ class DatabaseAdapter(ABC):
         *,
         create_target: bool = True,
         overwrite: bool = False,
+        skip_missing_extensions: bool = False,
     ) -> None:
         """Stream a full copy of this database into the target database.
 
         With overwrite=True the target database is dropped and recreated
-        first, so the copy always lands in an empty database."""
+        first, so the copy always lands in an empty database.
+
+        skip_missing_extensions asks the adapter to omit database extensions
+        the target server cannot provide instead of failing on them. Engines
+        with no concept of extensions accept it and ignore it."""
+
+    def object_count(self) -> int | None:
+        """How many user objects (tables, views, collections) the database
+        holds, or None when the adapter cannot cheaply find out.
+
+        Used to report what a copy actually moved, so "copy complete" can
+        never quietly mean "copied nothing". Not abstract: an adapter without
+        a query tool may leave it unanswered."""
+        return None
 
     @abstractmethod
     def clean_database(self) -> None:

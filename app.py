@@ -93,21 +93,29 @@ def _normalize_url(url: str) -> str:
 
 def _run_copy(
     job_id: str, source_url: str, target_url: str,
-    create_target: bool, overwrite: bool,
+    create_target: bool, overwrite: bool, skip_missing_extensions: bool,
 ) -> None:
     with _jobs_lock:
         _jobs[job_id]["status"] = "running"
     try:
-        core.copy_database(
+        summary = core.copy_database(
             source_url, target_url,
             create_target=create_target, overwrite=overwrite,
+            skip_missing_extensions=skip_missing_extensions,
         )
     except Exception as exc:
         with _jobs_lock:
             _jobs[job_id].update(status="error", error=str(exc), finished_at=_now())
     else:
         with _jobs_lock:
-            _jobs[job_id].update(status="done", finished_at=_now())
+            # Report what actually landed: a copy from an empty/wrong source
+            # database succeeds while moving nothing, and the counts are the
+            # only way the dashboard can tell that apart from a real copy.
+            _jobs[job_id].update(
+                status="done", finished_at=_now(),
+                source_objects=summary["source_objects"],
+                target_objects=summary["target_objects"],
+            )
 
 
 # ---- API --------------------------------------------------------------------
@@ -117,6 +125,7 @@ class CopyRequest(BaseModel):
     target_url: str
     create_target: bool = True
     overwrite: bool = False
+    skip_missing_extensions: bool = False
 
 
 class TestRequest(BaseModel):
@@ -144,6 +153,7 @@ def test_connection(req: TestRequest):
             message += (
                 "\nHint: connection string format should be:\n"
                 "  postgresql://user:password@host:5432/dbname\n"
+                "  mysql://user:password@host:3306/dbname\n"
                 "  mongodb://user:password@host:27017/dbname\n"
                 "If password contains special chars, use percent encoding:\n"
                 "  $ → %24, @ → %40, # → %23, [ → %5B, ] → %5D, : → %3A\n"
@@ -176,7 +186,9 @@ def start_copy(req: CopyRequest):
         source = get_adapter(source_url)
         target = get_adapter(target_url)
         if type(source) is not type(target):
-            raise ValueError("Cross-database copy (e.g. Postgres -> MySQL) is not supported.")
+            raise ValueError(
+                "Cross-database copy (e.g. Postgres -> MySQL) is not supported."
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -189,13 +201,15 @@ def start_copy(req: CopyRequest):
             "target": _redact(target_url),
             "status": "pending",
             "error": None,
+            "source_objects": None,
+            "target_objects": None,
             "started_at": _now(),
             "finished_at": None,
         }
     threading.Thread(
         target=_run_copy,
         args=(job_id, source_url, target_url,
-              req.create_target, req.overwrite),
+              req.create_target, req.overwrite, req.skip_missing_extensions),
         daemon=True,
     ).start()
     return {"job_id": job_id}
