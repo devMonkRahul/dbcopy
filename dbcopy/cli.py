@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_copy.add_argument(
         "--skip-missing-extensions", action="store_true",
         help="PostgreSQL: copy without the extensions the target server does "
-             "not have installed, instead of failing (lossy — objects that "
+             "not have installed, instead of failing (lossy: objects that "
              "depend on them will not copy)",
     )
     p_copy.add_argument(

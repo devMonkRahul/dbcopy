@@ -343,6 +343,15 @@ class PostgresAdapter(DatabaseAdapter):
                     "installed. Install it there, or re-run with "
                     "--skip-missing-extensions."
                 )
+            elif exclude_extensions:
+                # This copy ran with extensions skipped, so an object that
+                # cannot be created is very likely one that depended on them.
+                message += (
+                    "\nHint: this copy skipped the extensions the target "
+                    f"does not have ({', '.join(exclude_extensions)}), so "
+                    "objects that depend on them cannot be created. Install "
+                    "those extensions on the target to copy it in full."
+                )
             if "already exists" in message:
                 message += (
                     "\nHint: the target database already contains objects. "

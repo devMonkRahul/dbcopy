@@ -161,7 +161,7 @@ class MongoAdapter(DatabaseAdapter):
             # subprocess.run kills the child before re-raising.
             raise RuntimeError(
                 f"Timed out after {int(timeout)}s connecting with "
-                f"{os.path.basename(cmd[0])}. The server did not respond — check "
+                f"{os.path.basename(cmd[0])}. The server did not respond - check "
                 "the host/port and that it is reachable from here (firewall / "
                 "VPN), and for hosted databases (e.g. MongoDB Atlas) that your "
                 "current IP is on the access list."

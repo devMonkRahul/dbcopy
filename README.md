@@ -39,7 +39,7 @@ API endpoints (also usable directly):
 | Endpoint              | Method | Purpose                                       |
 |-----------------------|--------|-----------------------------------------------|
 | `/api/test`           | POST   | Test a connection string                      |
-| `/api/copy`           | POST   | Start a copy job (`overwrite` drops + recreates the target first), returns `job_id` |
+| `/api/copy`           | POST   | Start a copy job (`overwrite` drops + recreates the target first; `skip_missing_extensions` omits extensions the target lacks), returns `job_id` |
 | `/api/clean`          | POST   | Remove ALL tables/objects from a database     |
 | `/api/jobs/{job_id}`  | GET    | Poll job status                               |
 | `/api/jobs`           | GET    | List all jobs (passwords redacted)            |
@@ -68,6 +68,11 @@ python -m dbcopy restore postgresql://user:pass@host:5432/newdb -i mydb.dump
 
 # Restore over an existing database, dropping old objects first
 python -m dbcopy restore mysql://user:pass@host:3306/mydb -i mydb.sql --clean
+
+# Copy out of Supabase/RDS into a plain server that lacks its extensions
+python -m dbcopy copy \
+  postgresql://user:pass@db.abcdefg.supabase.co:5432/postgres \
+  postgresql://user:pass@target-host:5432/mycopy --skip-missing-extensions
 
 # Copy into a target that already has data: drop + recreate it first
 python -m dbcopy copy \
@@ -146,6 +151,35 @@ A consequence: copying from a **newer** server to an **older** one is
 rejected up front with a clear message. pg_dump cannot read a server newer
 than itself, and cannot emit SQL an older server accepts, so no client
 version satisfies both ends — upgrade the target, or migrate by hand.
+
+### PostgreSQL extensions
+
+A dump recreates the source's extensions with `CREATE EXTENSION`, which
+fails when the extension is not installed on the target machine. This is the
+usual wall when copying out of a managed Postgres such as Supabase or RDS,
+whose databases carry extensions (`supabase_vault`, `pg_graphql`, `vector`,
+…) a stock server does not have.
+
+dbcopy checks this before starting and names **every** missing extension at
+once, rather than failing on whichever one comes first:
+
+```
+Error: The source database uses PostgreSQL extensions that the target server
+does not have available:
+  pg_graphql, supabase_vault, vector
+```
+
+Either install them on the target (the extension files must exist on the
+server itself), or copy without them:
+
+```bash
+python -m dbcopy copy SOURCE_URL TARGET_URL --skip-missing-extensions
+```
+
+Skipping is lossy: extensions the target *does* have are still created, but
+anything that depends on a skipped one — a `vector` column, a function
+calling into it — will not copy, and the error says so. It works well when
+the extension only backs a managed provider's own internal schemas.
 
 MySQL publishes no client-only bundle, so dbcopy downloads the Community
 Server archive and installs only the parts it runs — the two client

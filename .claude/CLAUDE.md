@@ -225,7 +225,31 @@ downloads and caches portable binaries itself (see decision 10).
     - `copy_to` rejects a **downgrade** (source major > target major) up
       front: pg_dump refuses to read a server newer than itself, so no client
       version can satisfy both ends. Clear error beats a cryptic one.
-16. **A copy reports what it actually moved.** `copy_database` returns
+16. **Extensions the target cannot provide are caught before the copy
+    starts.** A dump recreates the source's extensions with
+    `CREATE EXTENSION`, which fails hard when the package is not installed on
+    the target machine — the common wall when copying out of a managed
+    Postgres (Supabase, RDS). `copy_to` diffs the source's `pg_extension`
+    against the target's `pg_available_extensions` and raises listing **every**
+    missing one, instead of dying part-way through on whichever one pg_dump
+    emitted first. `skip_missing_extensions=True` (CLI
+    `--skip-missing-extensions`, API field) passes `--exclude-extension` for
+    each instead.
+    - GOTCHA: `--exclude-extension` only exists in **pg_dump 17+**
+      (`EXCLUDE_EXTENSION_MIN_MAJOR`); 16 has only the include-form
+      `--extension`. When the source-matched client is older, the dump client
+      is bumped to 17 — legal as long as it stays <= the target major
+      (decision 15) — and otherwise raises rather than silently ignoring the
+      request.
+    - Skipping is lossy by nature: an object that USES a skipped extension
+      (a `vector` column, say) still fails. That is verified, and the restore
+      error appends a hint naming the skipped extensions so the cause is
+      obvious. Extensions the target *does* have are still created normally.
+    - `_server_query(sql)` is the shared "ask the server, not a specific
+      database" helper (tries this adapter's db, falls back to `postgres`);
+      both `server_major_version` and `available_extensions` use it, because
+      copy_to interrogates the target before its database exists.
+17. **A copy reports what it actually moved.** `copy_database` returns
     `{source_objects, target_objects, target_database, target_endpoint}`;
     `adapter.object_count()` backs it (concrete in `base.py` returning None,
     implemented for Postgres and MySQL, left None for Mongo — counting
@@ -291,10 +315,13 @@ for minutes and the dashboard fetch dies with browser "Failed to fetch".
 when the error is a timeout.
 
 `copy` prints the target database name and how many tables/views landed,
-and says so explicitly when the source database was empty (decision 16).
+and says so explicitly when the source database was empty (decision 17).
+`copy --skip-missing-extensions` (Postgres) copies without the extensions the
+target server lacks (decision 16).
 
 Dashboard API: `POST /api/test` {url}, `POST /api/copy` {source_url,
-target_url, create_target, overwrite}, `POST /api/clean` {url},
+target_url, create_target, overwrite, skip_missing_extensions},
+`POST /api/clean` {url},
 `GET /api/jobs/{id}`, `GET /api/jobs`.
 
 ## Verified working (tested 2026-06-10, PostgreSQL servers on :5432/:5434, Python 3.14)
@@ -380,6 +407,24 @@ function and a serial sequence:
   copy reports `done` with both 0 rather than an indistinguishable success.
 - MySQL suite (18 checks) re-run green after the shared `core.copy_database`
   signature change.
+
+## Extension handling verified (tested 2026-09-09)
+
+Reproduced the reported Supabase failure with `pgvector/pgvector:pg17` as
+source (has `vector` + `pgcrypto`) and stock `postgres:17` as target (has
+`pgcrypto` only):
+
+- Default: refuses up front naming `vector` only — `pgcrypto` is correctly
+  NOT reported, because the target has it available.
+- `--skip-missing-extensions` with a table using a `vector(3)` column: still
+  fails (`type "public.vector" does not exist`) and the hint explains that a
+  skipped extension is the cause. This is the documented lossy limit.
+- `--skip-missing-extensions` with no object depending on it (the Supabase
+  shape, where `supabase_vault` serves the internal `vault` schema rather
+  than the user's tables): copy succeeds, rows intact, `pgcrypto` still
+  created on the target, `vector` omitted.
+- Same three paths verified through `/api/copy` with
+  `{"skip_missing_extensions": true}`.
 
 ## Roadmap / next steps (owner's stated intent)
 

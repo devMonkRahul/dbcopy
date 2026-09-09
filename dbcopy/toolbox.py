@@ -501,7 +501,7 @@ def _ensure_family_bin(family: _ToolFamily, version: str | None = None) -> Path:
     install_dir = bin_dir.parent
     install_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    _status(f"{family.key} not found — fetching portable binaries "
+    _status(f"{family.key} not found - fetching portable binaries "
             f"({version}, {token}) into {install_dir} (one-time setup)")
 
     with tempfile.TemporaryDirectory(dir=install_dir.parent) as tmp:
