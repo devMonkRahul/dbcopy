@@ -14,17 +14,29 @@ import datetime
 import threading
 import uuid
 
+from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit, quote
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from dbcopy import core
 from dbcopy.adapters import get_adapter
+from dbcopy.engines import mongo
+from dbcopy.engines.mongo import copier as mongo_copier
+from dbcopy.engines.mongo.routes import router as mongo_router
+
+STATIC = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="dbcopy", description="Database backup / restore / copy")
+
+# The MongoDB engine owns /api/engines/mongo/* — its job store and SSE
+# progress stream. Included before the static mount below, which catches
+# everything left over at "/". Its page is served from here, at /mongodb.
+app.include_router(mongo_router)
 
 # Enable CORS for all origins (needed when dashboard is accessed from different network/host)
 app.add_middleware(
@@ -138,7 +150,13 @@ def test_connection(req: TestRequest):
     Sync endpoint: FastAPI runs it in a threadpool, so it never blocks."""
     try:
         normalized_url = _normalize_url(req.url)
-        get_adapter(normalized_url).test_connection()
+        if mongo.is_mongo_url(normalized_url):
+            # A plain ping, not inspect(): listing databases needs a privilege
+            # a user scoped to one database does not have, and "can I reach
+            # it" is the only question this button asks.
+            mongo_copier.ping(normalized_url)
+        else:
+            get_adapter(normalized_url).test_connection()
     except Exception as exc:
         message = str(exc)
         # Add helpful hints for common errors
@@ -183,12 +201,7 @@ def start_copy(req: CopyRequest):
         target_url = _normalize_url(req.target_url)
         
         # Fail fast on bad URLs / cross-engine copies before spawning the job.
-        source = get_adapter(source_url)
-        target = get_adapter(target_url)
-        if type(source) is not type(target):
-            raise ValueError(
-                "Cross-database copy (e.g. Postgres -> MySQL) is not supported."
-            )
+        core.check_copy_pair(source_url, target_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -228,6 +241,15 @@ def job_status(job_id: str):
 def list_jobs():
     with _jobs_lock:
         return sorted(_jobs.values(), key=lambda j: j["started_at"], reverse=True)
+
+
+# ---- pages ------------------------------------------------------------------
+
+@app.get("/mongodb", include_in_schema=False)
+def mongo_screen():
+    """The MongoDB copy screen. Registered here rather than on the engine's
+    router so it gets a short, memorable URL instead of an /api/... one."""
+    return FileResponse(STATIC / "mongo.html")
 
 
 # Serve the static files (HTML Dashboard) on the root path LAST

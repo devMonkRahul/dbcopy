@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dbcopy — MongoDB copy</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen flex justify-center px-4 py-10">
+
+    <main class="w-full max-w-5xl">
+        <div class="flex items-baseline justify-between mb-1">
+            <h1 class="text-3xl font-bold">
+                db<span class="text-green-400">copy</span>
+                <span class="text-slate-500 font-normal text-2xl">/ MongoDB</span>
+            </h1>
+
+            <a href="/" class="text-sm text-slate-400 hover:text-blue-400 transition">
+                ← PostgreSQL &amp; MySQL
+            </a>
+        </div>
+
+        <div class="text-slate-400 mb-7">
+            Copies every collection, its documents, its options and its
+            indexes — plus views — from one deployment into another.
+            Users, roles and server settings are not copied.
+        </div>
+
+        <div class="grid md:grid-cols-[1fr_44px_1fr] gap-3 items-stretch">
+            <!-- Source -->
+            <div class="bg-slate-900 border border-slate-700 rounded-xl p-5">
+                <h2 class="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                    Source deployment
+                </h2>
+
+                <input
+                    id="src-uri"
+                    type="text"
+                    spellcheck="false"
+                    placeholder="mongodb://user:pass@host:27017 | mongodb+srv://..."
+                    class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-green-400"
+                />
+
+                <div class="flex flex-wrap items-center gap-3 mt-3">
+                    <button
+                        id="src-connect"
+                        onclick="connect('src')"
+                        class="px-4 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:border-green-400 transition"
+                    >
+                        Connect
+                    </button>
+
+                    <span id="src-status" class="text-sm min-h-[18px]"></span>
+                </div>
+
+                <div id="src-db-wrap" class="hidden mt-4">
+                    <label class="block text-xs uppercase tracking-widest text-slate-400 mb-2">
+                        Database to copy
+                    </label>
+
+                    <select
+                        id="src-db"
+                        class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-green-400"
+                    ></select>
+                </div>
+            </div>
+
+            <!-- Arrow -->
+            <div class="hidden md:flex items-center justify-center text-green-400 text-2xl">
+                →
+            </div>
+
+            <!-- Target -->
+            <div class="bg-slate-900 border border-slate-700 rounded-xl p-5">
+                <h2 class="text-xs uppercase tracking-widest text-slate-400 mb-3">
+                    Target deployment
+                </h2>
+
+                <input
+                    id="dst-uri"
+                    type="text"
+                    spellcheck="false"
+                    placeholder="mongodb://user:pass@host:27017 | mongodb+srv://..."
+                    class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-green-400"
+                />
+
+                <div class="flex flex-wrap items-center gap-3 mt-3">
+                    <button
+                        id="dst-connect"
+                        onclick="connect('dst')"
+                        class="px-4 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:border-green-400 transition"
+                    >
+                        Connect
+                    </button>
+
+                    <span id="dst-status" class="text-sm min-h-[18px]"></span>
+                </div>
+
+                <div id="dst-db-wrap" class="hidden mt-4">
+                    <label class="block text-xs uppercase tracking-widest text-slate-400 mb-2">
+                        Database to create / write into
+                    </label>
+
+                    <input
+                        id="dst-db"
+                        type="text"
+                        spellcheck="false"
+                        placeholder="same name as the source"
+                        class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-green-400"
+                    />
+
+                    <div class="text-xs text-slate-400 mt-2">
+                        Created automatically — MongoDB makes a database on
+                        first write. Leave empty to reuse the source name.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Options -->
+        <div class="flex flex-wrap items-center gap-5 mt-5">
+            <button
+                id="go"
+                disabled
+                class="px-6 py-3 rounded-lg bg-green-500 text-slate-950 font-semibold hover:bg-green-400 disabled:opacity-50 disabled:cursor-not-allowed"
+                onclick="startCopy()"
+            >
+                Start copy
+            </button>
+
+            <button
+                id="cancel"
+                class="hidden px-4 py-3 rounded-lg border border-slate-700 bg-slate-800 hover:border-red-400 hover:text-red-400 transition"
+                onclick="cancelCopy()"
+            >
+                Cancel
+            </button>
+
+            <label class="flex items-center gap-2 text-slate-400">
+                <input id="drop" type="checkbox" />
+                replace the target database
+            </label>
+
+            <label class="flex items-center gap-2 text-slate-400">
+                <input id="indexes" type="checkbox" checked />
+                copy indexes
+            </label>
+
+            <label class="flex items-center gap-2 text-slate-400">
+                batch size
+                <input
+                    id="batch"
+                    type="number"
+                    min="1"
+                    max="10000"
+                    value="1000"
+                    class="w-24 px-2 py-1 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-green-400"
+                />
+            </label>
+
+            <span id="copy-status" class="text-sm"></span>
+        </div>
+
+        <div id="hint" class="text-xs text-slate-500 mt-3">
+            Connect to both deployments to enable the copy. Without
+            <b>replace</b> the copy is additive: documents whose <code>_id</code>
+            already exists are skipped, so an interrupted run can simply be
+            started again.
+        </div>
+
+        <!-- Progress -->
+        <div
+            id="progress"
+            class="hidden mt-7 bg-slate-900 border border-slate-700 rounded-xl p-5"
+        >
+            <div class="flex items-baseline justify-between mb-3">
+                <h2 class="text-xs uppercase tracking-widest text-slate-400">
+                    Progress
+                </h2>
+
+                <span id="job-state" class="text-sm"></span>
+            </div>
+
+            <div class="h-2 rounded-full bg-slate-800 overflow-hidden">
+                <div
+                    id="bar"
+                    class="h-full bg-green-500 transition-all duration-300"
+                    style="width: 0%"
+                ></div>
+            </div>
+
+            <div id="totals" class="text-sm text-slate-400 mt-2"></div>
+
+            <div id="job-error" class="hidden text-sm text-red-400 whitespace-pre-wrap mt-3"></div>
+
+            <div class="overflow-x-auto mt-5">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-slate-400">
+                            <th class="text-left px-3 py-2 font-medium border-b border-slate-700">Collection</th>
+                            <th class="text-right px-3 py-2 font-medium border-b border-slate-700">Copied</th>
+                            <th class="text-right px-3 py-2 font-medium border-b border-slate-700">Of ~</th>
+                            <th class="text-right px-3 py-2 font-medium border-b border-slate-700">Skipped</th>
+                            <th class="text-right px-3 py-2 font-medium border-b border-slate-700">Indexes</th>
+                            <th class="text-left px-3 py-2 font-medium border-b border-slate-700">State</th>
+                        </tr>
+                    </thead>
+                    <tbody id="coll-body"></tbody>
+                </table>
+            </div>
+
+            <h2 class="text-xs uppercase tracking-widest text-slate-400 mt-6 mb-2">
+                Log
+            </h2>
+
+            <pre
+                id="log"
+                class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs text-slate-300 max-h-64 overflow-y-auto whitespace-pre-wrap"
+            ></pre>
+        </div>
+    </main>
+
+    <script>
+        const connected = { src: false, dst: false };
+        let stream = null;
+        let jobId = null;
+
+        function spinner() {
+            return `
+                <span
+                    class="inline-block w-4 h-4 border-2 border-green-400 border-t-transparent rounded-full animate-spin align-middle"
+                ></span>
+            `;
+        }
+
+        function badgeClass(state) {
+            switch (state) {
+                case "done":
+                    return "bg-green-900/50 text-green-400";
+                case "failed":
+                    return "bg-red-900/50 text-red-400";
+                case "cancelled":
+                case "skipped":
+                    return "bg-amber-900/50 text-amber-400";
+                case "running":
+                case "copying":
+                case "queued":
+                    return "bg-blue-900/50 text-blue-400";
+                default:
+                    return "bg-slate-800 text-slate-300";
+            }
+        }
+
+        /* Connection strings carry passwords: show the host, never the URI. */
+        function hostLabel(uri) {
+            const afterScheme = (uri.split("://")[1] || "");
+            const authority = afterScheme.split("/")[0];
+            const at = authority.lastIndexOf("@");
+            const hosts = at === -1 ? authority : authority.slice(at + 1);
+            return hosts.split(",")[0] || "(unknown host)";
+        }
+
+        function num(n) {
+            return (n || 0).toLocaleString();
+        }
+
+        function el(id) {
+            return document.getElementById(id);
+        }
+
+        async function post(url, body) {
+            let r;
+
+            try {
+                r = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+            } catch (e) {
+                throw new Error(
+                    "Could not reach the dbcopy server — is it still running? (python main.py)"
+                );
+            }
+
+            const data = await r.json().catch(() => ({}));
+
+            if (!r.ok) {
+                /* FastAPI validation errors arrive as a list of objects. */
+                const d = data.detail;
+                throw new Error(
+                    typeof d === "string"
+                        ? d
+                        : Array.isArray(d)
+                        ? d.map((e) => e.msg).join("; ")
+                        : r.statusText
+                );
+            }
+
+            return data;
+        }
+
+        async function connect(which) {
+            const status = el(which + "-status");
+            const uri = el(which + "-uri").value.trim();
+
+            if (!uri) {
+                status.className = "text-sm text-red-400";
+                status.textContent = "Enter a connection string first";
+                return;
+            }
+
+            connected[which] = false;
+            refreshGo();
+
+            status.className = "text-sm text-slate-400";
+            status.innerHTML = spinner() + ' <span class="ml-1">connecting…</span>';
+
+            try {
+                const res = await post("/api/engines/mongo/connect", { uri });
+
+                status.className = "text-sm text-green-400";
+                status.textContent = `✓ MongoDB ${res.version} at ${hostLabel(uri)}`;
+
+                if (which === "src") {
+                    fillDatabases(res);
+                } else {
+                    el("dst-db-wrap").classList.remove("hidden");
+                }
+
+                connected[which] = true;
+            } catch (e) {
+                status.className = "text-sm text-red-400";
+                status.textContent = "✗ " + e.message;
+            }
+
+            refreshGo();
+        }
+
+        function fillDatabases(res) {
+            const select = el("src-db");
+            const user = res.databases.filter((d) => !d.system);
+            const list = user.length ? user : res.databases;
+
+            select.innerHTML = list
+                .map(
+                    (d) =>
+                        `<option value="${d.name}">${d.name}${
+                            d.system ? " (system)" : ""
+                        } — ${(d.size_on_disk / 1048576).toFixed(1)} MB</option>`
+                )
+                .join("");
+
+            if (res.default_db && list.some((d) => d.name === res.default_db)) {
+                select.value = res.default_db;
+            }
+
+            el("src-db-wrap").classList.remove("hidden");
+        }
+
+        function refreshGo() {
+            el("go").disabled = !(connected.src && connected.dst);
+        }
+
+        async function startCopy() {
+            const status = el("copy-status");
+
+            const sourceUri = el("src-uri").value.trim();
+            const targetUri = el("dst-uri").value.trim();
+            const sourceDb = el("src-db").value;
+            const targetDb = el("dst-db").value.trim() || sourceDb;
+            const drop = el("drop").checked;
+
+            /* Replacing the target is the one irreversible thing here. */
+            if (
+                drop &&
+                !confirm(
+                    `This will DROP the database "${targetDb}" on ` +
+                        `${hostLabel(targetUri)} and everything in it, then ` +
+                        `copy "${sourceDb}" into it.\n\nContinue?`
+                )
+            ) {
+                return;
+            }
+
+            el("go").disabled = true;
+            status.className = "text-sm text-slate-400";
+            status.innerHTML = spinner() + ' <span class="ml-1">starting…</span>';
+
+            try {
+                const res = await post("/api/engines/mongo/copy", {
+                    source_uri: sourceUri,
+                    source_db: sourceDb,
+                    target_uri: targetUri,
+                    target_db: targetDb,
+                    drop_target: drop,
+                    copy_indexes: el("indexes").checked,
+                    batch_size: Number(el("batch").value) || 1000,
+                });
+
+                jobId = res.job_id;
+                status.textContent = "";
+                el("progress").classList.remove("hidden");
+                el("cancel").classList.remove("hidden");
+                follow(jobId);
+            } catch (e) {
+                status.className = "text-sm text-red-400";
+                status.textContent = "✗ " + e.message;
+                refreshGo();
+            }
+        }
+
+        function follow(id) {
+            stream = new EventSource(`/api/engines/mongo/jobs/${id}/stream`);
+            stream.onmessage = (event) => render(JSON.parse(event.data));
+            stream.onerror = () => {
+                closeStream();
+                const status = el("copy-status");
+                status.className = "text-sm text-amber-400";
+                status.textContent =
+                    "Lost the progress stream — the copy may still be running. Reload to stop watching.";
+                refreshGo();
+            };
+        }
+
+        function closeStream() {
+            if (stream) {
+                stream.close();
+                stream = null;
+            }
+            el("cancel").classList.add("hidden");
+        }
+
+        async function cancelCopy() {
+            if (!jobId) return;
+
+            if (
+                !confirm(
+                    "Stop the copy?\n\nDocuments already written stay written — " +
+                        "cancelling does not roll anything back."
+                )
+            ) {
+                return;
+            }
+
+            el("cancel").disabled = true;
+
+            try {
+                await post(`/api/engines/mongo/jobs/${jobId}/cancel`, {});
+            } catch (e) {
+                /* The stream reports the real outcome either way. */
+            }
+
+            el("cancel").disabled = false;
+        }
+
+        function render(job) {
+            el("bar").style.width = `${job.percent}%`;
+
+            el("job-state").innerHTML = `
+                <span class="inline-flex rounded-full px-3 py-1 text-xs ${badgeClass(
+                    job.state
+                )}">${job.state}</span>
+            `;
+
+            el("totals").textContent =
+                `${num(job.copied_docs)} of ~${num(job.total_docs)} documents ` +
+                `(${job.percent}%) — "${job.source_db}" → "${job.target_db}"`;
+
+            const err = el("job-error");
+
+            if (job.error) {
+                err.textContent = job.error;
+                err.classList.remove("hidden");
+            } else {
+                err.classList.add("hidden");
+            }
+
+            el("coll-body").innerHTML = job.collections
+                .map(
+                    (c) => `
+                        <tr>
+                            <td class="px-3 py-2 border-b border-slate-800 font-mono text-xs">${c.name}</td>
+                            <td class="px-3 py-2 border-b border-slate-800 text-right">${num(c.copied)}</td>
+                            <td class="px-3 py-2 border-b border-slate-800 text-right text-slate-400">${num(c.total)}</td>
+                            <td class="px-3 py-2 border-b border-slate-800 text-right text-slate-400">${num(c.skipped)}</td>
+                            <td class="px-3 py-2 border-b border-slate-800 text-right text-slate-400">${num(c.indexes)}</td>
+                            <td class="px-3 py-2 border-b border-slate-800">
+                                <span class="inline-flex rounded-full px-3 py-1 text-xs ${badgeClass(
+                                    c.state
+                                )}">${c.state}</span>
+                            </td>
+                        </tr>
+                    `
+                )
+                .join("");
+
+            const log = el("log");
+            const atBottom =
+                log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+
+            log.textContent = job.log.join("\n");
+
+            if (atBottom) {
+                log.scrollTop = log.scrollHeight;
+            }
+
+            /* The server closes the stream on a terminal state; close our end
+               too, or the browser reconnects to a finished job. */
+            if (["done", "failed", "cancelled"].includes(job.state)) {
+                closeStream();
+
+                const status = el("copy-status");
+
+                if (job.state === "done") {
+                    status.className = "text-sm text-green-400";
+                    status.textContent = `✓ copied ${num(job.copied_docs)} documents`;
+                } else if (job.state === "cancelled") {
+                    status.className = "text-sm text-amber-400";
+                    status.textContent =
+                        "Cancelled — documents already written were kept";
+                } else {
+                    status.className = "text-sm text-red-400";
+                    status.textContent = "✗ copy failed — see the error above";
+                }
+
+                refreshGo();
+            }
+        }
+    </script>
+</body>
+</html>

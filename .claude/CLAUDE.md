@@ -3,32 +3,49 @@
 ## What this project is
 
 A Python tool to backup, restore, and make a full copy of a database from a
-source to a target, with a CLI and a FastAPI web dashboard. PostgreSQL,
-MySQL, and MongoDB are supported today; the architecture is designed so
-other engines can be added later without touching core code. **The tool is self-sufficient: it
-does not require any database client tools to be installed locally** — it
-downloads and caches portable binaries itself (see decision 10).
+source to a target, with a CLI and a FastAPI web dashboard. PostgreSQL and
+MySQL support all four operations; MongoDB supports copy only. The
+architecture is designed so other engines can be added later without
+touching core code. **The tool is self-sufficient: it does not require any
+database client tools to be installed locally** — it downloads and caches
+portable binaries itself (see decision 10), and MongoDB needs no binaries at
+all because it runs on the pymongo driver (see decision 13).
 
 ## Core design decisions (do not change without good reason)
 
-1. **Wrap native tools, never reimplement dump logic.** Backup/restore/copy
-   shell out to `pg_dump`/`pg_restore`/`psql`, `mysqldump`/`mysql`, and
-   `mongodump`/`mongorestore`. These correctly handle
-   schemas, data, sequences, indexes, constraints, views, and functions —
-   hand-rolled row copying breaks on sequences and FKs.
-2. **Adapter pattern for multi-DB support.** `dbcopy/adapters/base.py`
+1. **Wrap native tools, never reimplement dump logic — for SQL engines.**
+   Backup/restore/copy shell out to `pg_dump`/`pg_restore`/`psql` and
+   `mysqldump`/`mysql`. These correctly handle schemas, data, sequences,
+   indexes, constraints, views, and functions — hand-rolled row copying
+   breaks on sequences and FKs. **MongoDB is the deliberate exception**
+   (decision 13): it is driven through pymongo, because a document store has
+   no sequences or FKs to get wrong, and the driver buys live per-collection
+   progress, cancellation and resumability that piping `mongodump` into
+   `mongorestore` could not.
+2. **Adapter pattern for the tool-backed engines.** `dbcopy/adapters/base.py`
    defines the abstract `DatabaseAdapter` interface (`backup`, `restore`,
    `copy_to`, `test_connection`, `check_tools`). `get_adapter(url)` in
    `dbcopy/adapters/__init__.py` routes by URL scheme via the `ADAPTERS`
-   registry list.
+   registry list — which holds PostgreSQL and MySQL only. MongoDB is NOT an
+   adapter (it implements one operation of the five, so the interface does
+   not fit); `core._resolve_copy()` checks for a `mongodb://` URL first and
+   hands off to `dbcopy/engines/mongo/`. `get_adapter` on a Mongo URL
+   therefore raises "unsupported scheme" — every caller that could see one
+   routes before it gets there.
 3. **core.py stays UI-free.** No printing, no argparse — only raises
    exceptions. The CLI (`cli.py`) and the web app (`app.py`) both import it.
    (Exception: `toolbox.py` writes one-time download progress to stderr —
    infrastructure noise, never stdout.)
-4. **The `dbcopy` package stays stdlib-only.** No third-party imports inside
-   `dbcopy/` (argparse, subprocess, urllib, tarfile, hashlib). FastAPI is a
+4. **The `dbcopy` package stays stdlib-only, except `dbcopy/engines/`.**
+   No third-party imports in `adapters/`, `core.py`, `toolbox.py` or
+   `cli.py` (argparse, subprocess, urllib, tarfile, hashlib). FastAPI is a
    project dependency but is imported only by the web layer (`app.py`,
-   `main.py`), never by the package.
+   `main.py`). `dbcopy/engines/` is the documented carve-out for engines
+   that need a driver: `engines/mongo/copier.py` imports pymongo and
+   `engines/mongo/routes.py` imports FastAPI. The carve-out is contained —
+   `engines/mongo/__init__.py` is stdlib-only URL helpers, and `core.py`
+   imports `copier` *inside* `_copy_mongo()`, so a PostgreSQL or MySQL run
+   never imports pymongo at all.
 5. **Copy streams with no temp file:** `pg_dump --format=plain` piped into
    `psql --set ON_ERROR_STOP=on` on the target. Target DB is auto-created
    unless `--no-create` is passed. In `copy_to`, `dump.stdout` is closed by
@@ -41,18 +58,21 @@ downloads and caches portable binaries itself (see decision 10).
    different role on the target.
 8. **Passwords never go on the command line** (would leak in `ps` / shell
    history). Postgres uses the `PGPASSWORD` env var and MySQL the exactly
-   analogous `MYSQL_PWD`; MongoDB has no env-var equivalent, so the Mongo
-   adapter writes the password to a temporary `--config` YAML file
-   (mode 0600, deleted after) — see decision 13.
-9. **Cross-engine copy (Postgres -> MySQL) is intentionally unsupported**;
-   `core.copy_database` raises ValueError if adapter types differ (and
-   `app.py` rejects it with HTTP 400 before spawning a job).
+   analogous `MYSQL_PWD`. MongoDB spawns no subprocess at all, so the
+   question does not arise — the password stays in the URI held in memory.
+   `app.py`'s `_redact()` still hides it in job listings.
+9. **Cross-engine copy (Postgres -> MySQL, Postgres -> MongoDB) is
+   intentionally unsupported**; `core._resolve_copy` raises ValueError if
+   one side is Mongo and the other is not, or if adapter types differ.
+   `app.py` calls `core.check_copy_pair()` (the same check, no connection)
+   to reject it with HTTP 400 before spawning a job.
 10. **Self-managed client tools** (`dbcopy/toolbox.py`). Organized as a
-    `_ToolFamily` registry (`_PG`, `_MONGO_TOOLS`, `_MYSQL`) so each engine's
+    `_ToolFamily` registry (`_PG`, `_MYSQL`) so each engine's
     version/platform/download differences live in one descriptor; the public
     API `find_tool(name)` / `ensure_tools(names)` is unchanged and routes by
-    tool name via `_family_for_tool`. `find_tool(name)` resolves in this
-    order: family override env dir (`DBCOPY_PG_BIN` / `DBCOPY_MONGO_BIN` /
+    tool name via `_family_for_tool`. MongoDB has no entry here — it needs
+    no binaries. `find_tool(name)` resolves in this
+    order: family override env dir (`DBCOPY_PG_BIN` /
     `DBCOPY_MYSQL_BIN`) →
     managed cache `~/.dbcopy/tools/<dirname>-<ver>/bin` → system PATH →
     auto-download (SHA-256 verified best-effort, extracted atomically via
@@ -72,14 +92,6 @@ downloads and caches portable binaries itself (see decision 10).
       `DEFAULT_PG_VERSION` (18.4.0), override `DBCOPY_PG_VERSION`. One client
       version does NOT cover all servers — see decision 15: the major is
       chosen per server from `PG_VERSIONS`, so several may be cached.
-    - **MongoDB**: `fastdl.mongodb.org/tools/db`, asset
-      `mongodb-database-tools-{token}-{ver}.{zip|tgz}` (`.zip` on
-      Windows/macOS, `.tgz` on Linux — extraction branches on this; zip
-      restores the exec bit on POSIX). Token is OS/distro-based
-      (`windows-x86_64`, `macos-arm64`, `ubuntu2204-x86_64`, ...), NOT a rust
-      triple; no universal Linux build, so the distro defaults to
-      `ubuntu2204` and is overridable with `DBCOPY_MONGO_PLATFORM`. Pinned
-      `DEFAULT_MONGO_TOOLS_VERSION`, override `DBCOPY_MONGO_VERSION`.
     - **MySQL**: no client-only bundle is published, so the full Community
       Server archive is downloaded and pruned. Asset
       `mysql-{ver}-{token}.{zip|tar.gz|tar.xz}` where the token is a third
@@ -117,45 +129,80 @@ downloads and caches portable binaries itself (see decision 10).
     The CLI prompts (`clean` asks y/N unless `-y`); the UI uses JS
     `confirm()` for both the Clean button and the overwrite checkbox.
     `app.py`'s `/api/clean` and `overwrite` field trust the caller.
-13. **MongoDB adapter** (`dbcopy/adapters/mongo.py`, schemes `mongodb` /
-    `mongodb+srv`, default port 27017) wraps the MongoDB Database Tools:
-    `backup` → `mongodump --archive=<file> --gzip`; `restore` →
-    `mongorestore --archive=<file> --gzip [--drop if clean]`; `copy` →
-    `mongodump --archive | mongorestore --archive` streamed with the exact
-    SIGPIPE / no-`communicate()` pattern as Postgres (decision 5).
-    - **Connection** is passed as `--uri` with the password *stripped from the
-      URL string* (via `urlsplit`/`urlunsplit`, so `mongodb+srv`, comma seed
-      lists and query options survive). The password is supplied separately
-      through a temp `--config` file (decision 8). `serverSelectionTimeoutMS`
-      is injected (setdefault), BUT — GOTCHA — mongodump/mongorestore do NOT
-      honor it for an unreachable (firewalled / IP-not-allowlisted) host: they
-      hang indefinitely (verified). So the adapter enforces its OWN hard
-      `subprocess` timeout (`CONNECT_TIMEOUT`, 20s) on every connection-
-      establishing command via `_run(..., timeout=...)`; without it the web
-      request never returns. `test_connection` is bounded, and `copy_to`
-      pre-flights `test_connection()` on BOTH endpoints before the (unbounded,
-      possibly long) data pipe so an unreachable host fails fast instead of
-      hanging. The timeout error text triggers the existing `/api/test` hint.
-    - **GOTCHA — `_uri()` drops the database from the path** and the code always
-      passes the db explicitly (`--db` for dump, `--nsFrom/--nsTo` for copy).
-      Reason: `mongorestore` treats a database in the URI path as an implicit
-      `--db`, which silently conflicts with `--nsFrom/--nsTo` and restores **0
-      documents while still exiting 0** (looks like "Copy complete" but copies
-      nothing). Do NOT put the database back in the `--uri`. Because an
-      unspecified `authSource` defaults to that path db, `_uri()` pins
-      `authSource=<db>` before dropping the path so auth keeps working.
-    - **`overwrite`** uses `mongorestore --drop` — collection-level (drops
-      each collection as it is restored), NOT a whole-database drop.
-      `create_target` is effectively a no-op (Mongo creates DBs/collections
-      implicitly on first write).
-    - **`copy` remaps** the dumped db into the target db name with
-      `--nsFrom <src>.* --nsTo <tgt>.*` (equal single wildcards — a `*.*`→`X.*`
-      remap is illegal, the wildcard counts must match). `restore` does NOT
-      remap (it doesn't know the archive's source db), so it restores the
-      namespaces the archive carries.
-    - **`clean` is intentionally unsupported** for MongoDB: wiping a database
-      needs `mongosh`, which is deliberately not bundled. It raises a clear
-      RuntimeError pointing at `copy --overwrite`.
+13. **MongoDB copy engine** (`dbcopy/engines/mongo/`, schemes `mongodb` /
+    `mongodb+srv`, default port 27017) is driven by **pymongo**, not by the
+    MongoDB Database Tools. The tools-based adapter was removed: it could
+    not report progress, could not be cancelled, and needed a 20s subprocess
+    timeout because mongodump ignores `serverSelectionTimeoutMS` on an
+    unreachable host. pymongo honors its own timeouts, so that whole class
+    of workaround is gone.
+    - **Three modules.** `copier.py` is the engine and imports no web
+      framework — `core.py` drives it for the CLI and `routes.py` for HTTP,
+      both through the same five-call API (`inspect`, `JobStore.create`,
+      `run_copy`, `Job.snapshot`, `Job.cancel`). `routes.py` is an
+      `APIRouter` under `/api/engines/mongo`, mounted by `app.py`.
+      `__init__.py` is stdlib-only URL helpers (`is_mongo_url`,
+      `database_in_url`, `endpoint_of`) so `core` can route without
+      importing pymongo — see decision 4.
+    - **Copy only.** `backup`, `restore` and `clean` raise a clear ValueError
+      for a `mongodb://` URL (`core._reject_mongo`): the engine has no
+      dump-file format. `clean`'s message points at `copy --overwrite`.
+    - **What is copied:** every non-system collection, its documents, its
+      collection options (capped, time-series, validators, collation), its
+      secondary indexes, and views. GridFS comes free (`.files`/`.chunks`
+      are ordinary collections). Users/roles/server settings are not — they
+      live in `admin`.
+    - **GOTCHA — `create_collection` raises two different things.** pymongo
+      checks existence client-side and raises `CollectionInvalid`; the server
+      raises `OperationFailure` code 48 (NamespaceExists). Both must be
+      caught or every re-run into an existing target dies on the first
+      collection. This is the single easiest bug to reintroduce here.
+    - **GOTCHA — views need the same tolerance, and did not have it.** The
+      spec this was built from caught the already-exists pair for
+      collections but not for views, so a second copy into the same target
+      reported every view as `failed`. `_create_view()` now drops and
+      recreates an existing view (a view holds no data, so this is free and
+      leaves the target matching the source). Verified.
+    - **Views are created last.** A view referencing a collection that does
+      not exist yet fails, so `run_copy` partitions `listCollections` output
+      by `type` and does views after collections.
+    - **Server-owned metadata must be stripped before replay.**
+      `_DROP_CREATE_OPTS` (`idIndex`, `info`, `type`, `name`) and
+      `_DROP_INDEX_OPTS` (`v`, `ns`, `key`, `textIndexVersion`,
+      `2dsphereIndexVersion`, `background`) — passing any of them back into
+      `create_collection` or `IndexModel` is an error.
+    - **`socketTimeoutMS=0` is required** so a long `find` cursor is not
+      killed mid-copy; connect/server-selection stay at 8s so a wrong URI
+      fails fast (verified: unreachable host errors in ~10s, no hang).
+    - **Without `overwrite` a copy is additive, and that is the point.**
+      Documents whose `_id` is already present come back as duplicate-key
+      errors inside a `BulkWriteError`, are counted as `skipped`, and the
+      batch continues — so an interrupted run can just be re-run. Hence
+      `insert_many(ordered=False)` and the handler that separates code 11000
+      from every other write error (real errors still raise).
+      GOTCHA: a collision on a *unique secondary index* is also code 11000,
+      so it is counted as `skipped` too, not as a failure. That is
+      deliberate — the two are indistinguishable by code, and failing the
+      collection would break resumability. The per-collection `skipped`
+      count is where it surfaces. Verified.
+    - **`overwrite` (`drop_target`) drops the whole target database** before
+      copying, unlike the old adapter's collection-level
+      `mongorestore --drop`.
+    - **Totals are estimates.** `estimated_document_count()` reads metadata
+      instead of scanning (instant on a large database), so `percent` can
+      drift slightly past or short of 100 on a live source. Never gate
+      completion on it — gate on `state`.
+    - **Cancel stops, it does not roll back.** The worker checks the flag
+      between batches; documents already written stay written. The UI says so.
+    - **`run_copy` never raises** — it records `state`/`error` on the job so
+      a polling web caller sees the outcome. `Job.failure` keeps the original
+      exception (never serialised into `snapshot()`) so `core._copy_mongo`
+      can re-raise a user error as ValueError and everything else as
+      RuntimeError, matching the repo convention.
+    - `Job.on_log` is an optional sink invoked by `say()`; the CLI passes
+      `print` so a terminal copy streams progress, the web layer leaves it
+      unset and reads `snapshot()["log"]`. A raising sink is swallowed —
+      a broken log must not abort a running copy.
 
 14. **MySQL adapter** (`dbcopy/adapters/mysql.py`, scheme `mysql`, default
     port 3306) wraps `mysqldump` / `mysql`:
@@ -177,7 +224,8 @@ downloads and caches portable binaries itself (see decision 10).
       variable", verified); only the `mysql` client accepts it. So the flag
       lives in `_mysql_cmd()`, not `_conn_args()`, and `copy_to`
       pre-flights `test_connection()` (which uses `mysql`) on BOTH endpoints
-      before the unbounded data pipe — same reasoning as the Mongo adapter.
+      before the unbounded data pipe, so an unreachable host fails fast
+      instead of hanging.
     - **Dumps omit `CREATE DATABASE`/`USE`** (no `--databases`), so a dump
       restores into a database of any name, matching Postgres behavior.
       `DUMP_FLAGS` are all load-bearing: `--single-transaction`,
@@ -252,8 +300,11 @@ downloads and caches portable binaries itself (see decision 10).
 17. **A copy reports what it actually moved.** `copy_database` returns
     `{source_objects, target_objects, target_database, target_endpoint}`;
     `adapter.object_count()` backs it (concrete in `base.py` returning None,
-    implemented for Postgres and MySQL, left None for Mongo — counting
-    collections would need mongosh). The CLI prints the target database name
+    implemented for Postgres and MySQL). MongoDB builds the same summary in
+    `core._copy_mongo` from the job snapshot instead — `source_objects` is
+    the number of collections found, `target_objects` how many reached state
+    `done` — and adds `object_label` ("collection" vs "table/view") so the
+    CLI can name them correctly. The CLI prints the target database name
     and the count, and says outright when the source held nothing; `app.py`
     puts both counts on the job. Reason: a copy from an empty or
     misnamed source database succeeds while moving nothing, and "Copy
@@ -270,14 +321,21 @@ dbcopy/
 │   ├── base.py       # DatabaseAdapter ABC + ConnectionInfo dataclass
 │   ├── postgres.py   # PostgresAdapter
 │   ├── mysql.py      # MySQLAdapter (mysqldump / mysql)
-│   ├── mongo.py      # MongoAdapter (mongodump / mongorestore)
-│   └── __init__.py   # ADAPTERS registry + get_adapter(url)
+│   └── __init__.py   # ADAPTERS registry + get_adapter(url)  [PG + MySQL]
+├── engines/          # driver-backed engines; MAY import third-party libs
+│   └── mongo/
+│       ├── __init__.py  # SCHEMES + URL helpers, stdlib only
+│       ├── copier.py    # the pymongo engine; no FastAPI, no CLI imports
+│       └── routes.py    # APIRouter at /api/engines/mongo, mounted by app.py
 ├── core.py           # backup_database / restore_database / copy_database
 ├── toolbox.py        # self-managed client tools (_ToolFamily registry)
 ├── cli.py            # argparse CLI: backup | restore | copy
 └── __main__.py       # enables `python -m dbcopy`
-app.py                # FastAPI dashboard (HTML inline) + job API
+app.py                # FastAPI dashboard + job API + mongo router
 main.py               # `python main.py` -> uvicorn on 127.0.0.1:8000
+static/
+├── index.html        # PostgreSQL / MySQL dashboard
+└── mongo.html        # MongoDB copy screen (picker, SSE progress, cancel)
 ```
 
 ## CLI / dashboard usage
@@ -288,27 +346,32 @@ python -m dbcopy copy    mongodb://u:p@src:27017/proddb   mongodb://u:p@dst:2701
 python -m dbcopy copy    mysql://u:p@src:3306/proddb      mysql://u:p@dst:3306/staging    [--overwrite]
 python -m dbcopy backup  postgresql://u:p@host:5432/mydb -o mydb.dump
 python -m dbcopy restore postgresql://u:p@host:5432/newdb -i mydb.dump [--clean]
-python -m dbcopy clean   postgresql://u:p@host:5432/mydb [-y]   # removes ALL objects (not Mongo)
+python -m dbcopy clean   postgresql://u:p@host:5432/mydb [-y]   # removes ALL objects (PG/MySQL only)
 uv run python main.py    # dashboard at http://127.0.0.1:8000
 ```
 
 `copy --overwrite` drops + recreates the target DB first for Postgres (for
 non-empty targets, which otherwise fail fast with a clear "already exists"
-hint) and for MySQL; for MongoDB it means `mongorestore --drop`
-(collection-level). A MySQL copy into a non-empty target also succeeds
-*without* `--overwrite`, because mysqldump emits `DROP TABLE IF EXISTS` per
-table — `--overwrite` additionally removes objects absent from the source.
+hint), for MySQL, and for MongoDB (a whole-database `drop_database`). A
+MySQL copy into a non-empty target also succeeds *without* `--overwrite`,
+because mysqldump emits `DROP TABLE IF EXISTS` per table — `--overwrite`
+additionally removes objects absent from the source. A MongoDB copy without
+it is additive and therefore resumable (decision 13).
 Cross-engine copy (e.g. Postgres ↔ MongoDB) is rejected (decision 9).
+`backup` / `restore` / `clean` reject a `mongodb://` URL outright.
 
 URL format: `postgresql://user:password@host:port/dbname` (schemes
 `postgresql`/`postgres`), `mysql://...` (port defaults to 3306), or
 `mongodb://...` / `mongodb+srv://...` (port defaults to 27017). Credentials are percent-decoded (`p%40ss` -> `p@ss`);
 query params land in `ConnectionInfo.options` (Postgres `?sslmode=require`
--> PGSSLMODE; MySQL `?ssl-mode=REQUIRED` (or `?sslmode=`) -> `--ssl-mode`;
-Mongo query options are carried through in the `--uri`). The
+-> PGSSLMODE; MySQL `?ssl-mode=REQUIRED` (or `?sslmode=`) -> `--ssl-mode`).
+A Mongo URL is NOT parsed into ConnectionInfo — it is handed to pymongo
+verbatim, so `authSource`, `replicaSet`, `tls` and seed lists all just work;
+`dbcopy/engines/mongo/__init__.py` only reads the database name and a
+display endpoint out of it. The
 Postgres adapter sets `PGCONNECT_TIMEOUT=10` (setdefault, so a user-set env
 var wins), MySQL passes `--connect-timeout=10` to the `mysql` client, and
-the Mongo adapter injects `serverSelectionTimeoutMS=10000` —
+the Mongo engine uses pymongo's `serverSelectionTimeoutMS=8000` —
 without these, connecting to a firewalled host (typical RDS misconfig) hangs
 for minutes and the dashboard fetch dies with browser "Failed to fetch".
 `/api/test` appends an RDS hint (public accessibility + security group)
@@ -322,7 +385,19 @@ target server lacks (decision 16).
 Dashboard API: `POST /api/test` {url}, `POST /api/copy` {source_url,
 target_url, create_target, overwrite, skip_missing_extensions},
 `POST /api/clean` {url},
-`GET /api/jobs/{id}`, `GET /api/jobs`.
+`GET /api/jobs/{id}`, `GET /api/jobs`. All of these accept a `mongodb://`
+URL too (`/api/test` pings, `/api/copy` runs the engine), except `/api/clean`
+which reports the copy-only error.
+
+MongoDB screen (decision 13) is served at `GET /mongodb` by `app.py`, not
+by the engine router — the API below is what it calls:
+`POST /connect` {uri} -> {ok, version, databases[], default_db};
+`POST /copy` {source_uri, source_db, target_uri, target_db, drop_target,
+copy_indexes, batch_size, collections} -> {job_id};
+`GET /jobs/{id}` -> snapshot; `GET /jobs/{id}/stream` -> SSE snapshots every
+500 ms, closed by the server on a terminal state; `POST /jobs/{id}/cancel`.
+Job states: queued | running | done | failed | cancelled. Per collection:
+pending | copying | done | failed | skipped.
 
 ## Verified working (tested 2026-06-10, PostgreSQL servers on :5432/:5434, Python 3.14)
 
@@ -426,6 +501,56 @@ source (has `vector` + `pgcrypto`) and stock `postgres:17` as target (has
 - Same three paths verified through `/api/copy` with
   `{"skip_missing_extensions": true}`.
 
+## MongoDB re-verified on the pymongo engine (tested 2026-09-17, MongoDB 8.2.11 on :27017/:27018)
+
+Replaced the mongodump/mongorestore adapter entirely (decision 13). Fixture
+covered 8 collections + 1 view: 2500 docs with a unique and a compound
+index, a capped collection (max=100), a TTL index, a text index, a partial
+index, GridFS-shaped `.files`/`.chunks`, an empty collection, and a document
+of exotic BSON (ObjectId, Decimal128, Binary, tz-aware datetime, 2**62,
+nested arrays, CJK + emoji + quote/backslash text).
+
+Source and copy were compared with a fingerprint of every document (SHA-256
+over canonical `json_util` form, order-independent), plus collection options
+and full index definitions.
+
+- Fresh copy: **identical** — documents, collection options (capped/size/max
+  survived), every index, and the view definition.
+- Re-run without `--overwrite`: 0 copied, all 2701 counted as `skipped`
+  duplicates, target unchanged -> resumability confirmed.
+- Re-run with `--overwrite`: dropped first, back to exactly the source
+  counts, not doubled.
+- **Bug found and fixed:** the first re-run marked the view `failed`
+  ("collection high_scores already exists") because the spec tolerated the
+  already-exists error pair for collections but not views. `_create_view()`
+  now drops and recreates. See decision 13.
+- Unique secondary index violated by source data: the losing document is
+  counted as `skipped` (not a collection failure) and the other collections
+  still copy — verified, and documented as deliberate in decision 13.
+- Unreachable host (10.255.255.1): fails in ~10s via pymongo's own timeout,
+  no hang. The old adapter needed a manual 20s subprocess timeout for this.
+- Guardrails: same-URI-and-database rejected before anything is written,
+  cross-engine both directions rejected, a URL with no database rejected,
+  an empty/misnamed source database reports "No collections found".
+- CLI: `copy` streams live per-collection progress (`Job.on_log`) and
+  reports "now holds 9 collections" (not "tables/views"). `backup`,
+  `restore` and `clean` refuse a mongodb:// URL with the copy-only message.
+- Web (39 checks, all green): both screens serve, `/connect` lists and flags
+  system databases, unreachable host -> 400 not a hang, non-mongo scheme ->
+  422, copy job reaches `done` with 2701 docs and percent 100, SSE stream
+  carries `text/event-stream` + `X-Accel-Buffering: no` and closes itself on
+  a terminal state, cancel mid-run ends `cancelled` with partial data intact
+  and no error, unknown job -> 404, snapshot is JSON-serialisable and never
+  leaks the exception object, passwords redacted in `/api/jobs`.
+- Regression: PostgreSQL 17 copy / backup / `restore --clean` / `clean` all
+  still pass after the shared `core.copy_database` refactor, including the
+  sequence-state check (after copying 2 customers the next INSERT got id 3).
+
+Note: `python -m dbcopy` still needs the venv (`uv run python -m dbcopy`)
+because `cli.py` imports `web`, which imports `app`, which imports FastAPI
+at module level. Pre-existing, in tension with decision 4, not MongoDB's
+doing.
+
 ## Roadmap / next steps (owner's stated intent)
 
 1. **Dashboard enhancements**: backup/restore operations in the UI,
@@ -436,6 +561,9 @@ source (has `vector` + `pgcrypto`) and stock `postgres:17` as target (has
 3. Possible next engines: MariaDB (its client cannot do MySQL 8's default
    `caching_sha2_password`, so it needs its own tool family, not a reuse of
    `_MYSQL`), SQLite, MSSQL.
+4. MongoDB gaps left open by the copy-only engine: no backup-to-file, and
+   `collections: [...]` (subset copy) is wired through the HTTP API and
+   `run_copy` but not exposed on the CLI or the screen.
 
 ## Conventions
 

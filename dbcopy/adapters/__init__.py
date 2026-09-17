@@ -12,13 +12,11 @@ Adding another engine is just:
 from __future__ import annotations
 
 from .base import DatabaseAdapter
-from .mongo import MongoAdapter
 from .mysql import MySQLAdapter
 from .postgres import PostgresAdapter
 
 ADAPTERS: list[type[DatabaseAdapter]] = [
     PostgresAdapter,
-    MongoAdapter,
     MySQLAdapter,
 ]
 

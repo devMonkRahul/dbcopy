@@ -1,9 +1,13 @@
 """Abstract base class that every database adapter must implement.
 
-To add support for a new database (MySQL, MongoDB, ...), create a new
-module in this package with a class that subclasses DatabaseAdapter,
-then register it in dbcopy/adapters/__init__.py. Nothing else in the
-codebase needs to change.
+To add support for a new database that ships usable command-line tools,
+create a module in this package with a class that subclasses
+DatabaseAdapter, then register it in dbcopy/adapters/__init__.py.
+Nothing else in the codebase needs to change.
+
+An engine with no such tools does not belong here: MongoDB is driven by
+the pymongo driver from dbcopy/engines/mongo/ instead, because it
+supports copy alone and would leave most of this interface unimplemented.
 """
 
 from __future__ import annotations

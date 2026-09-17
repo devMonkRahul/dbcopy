@@ -4,7 +4,7 @@ Wraps the native client tools instead of reimplementing them:
   - backup  -> mysqldump --result-file=<file>   (plain SQL)
   - restore -> mysql < <file>
   - copy    -> mysqldump | mysql on the target (streamed, no intermediate
-               file — the same pattern as the Postgres and Mongo adapters)
+               file — the same pattern as the Postgres adapter)
 
 Notes specific to MySQL:
   * ``mysqldump`` has no compressed "custom" format like ``pg_dump``, so a

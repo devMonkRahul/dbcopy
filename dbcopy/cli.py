@@ -20,16 +20,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dbcopy",
         description="Backup, restore, and copy databases "
-                    "(PostgreSQL, MySQL and MongoDB).",
+                    "(PostgreSQL and MySQL; MongoDB is copy-only).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_backup = sub.add_parser("backup", help="Dump a database to a file")
     p_backup.add_argument(
         "url",
-        help="Database URL, e.g. postgresql://user:pass@host:5432/db, "
-             "mysql://user:pass@host:3306/db "
-             "or mongodb://user:pass@host:27017/db",
+        help="Database URL, e.g. postgresql://user:pass@host:5432/db "
+             "or mysql://user:pass@host:3306/db",
     )
     p_backup.add_argument("-o", "--output", help="Output file (default: <db>_<timestamp>.dump)")
 
@@ -41,7 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop existing objects in the target before restoring",
     )
 
-    p_copy = sub.add_parser("copy", help="Full copy of one database into another")
+    p_copy = sub.add_parser(
+        "copy",
+        help="Full copy of one database into another "
+             "(PostgreSQL, MySQL or MongoDB)",
+    )
     p_copy.add_argument("source_url", help="Source database URL")
     p_copy.add_argument("target_url", help="Target database URL")
     p_copy.add_argument(
@@ -57,13 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_copy.add_argument(
         "--overwrite", action="store_true",
         help="DROP and recreate the target database before copying "
-             "(use when the target already contains objects)",
+             "(use when the target already contains objects). For "
+             "MongoDB the target database is dropped before the "
+             "restore; without it a repeated copy skips documents "
+             "that are already there",
     )
 
     p_clean = sub.add_parser(
         "clean",
         help="Remove ALL tables and objects from a database (destructive; "
-             "PostgreSQL and MySQL only)",
+             "PostgreSQL and MySQL only - for MongoDB use copy --overwrite)",
     )
     p_clean.add_argument("url", help="Database URL to clean")
     p_clean.add_argument(
@@ -76,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Plural of each engine's object_label. Pluralisation is presentation, so it
+#: lives here rather than in core.
+_PLURALS = {"table/view": "tables/views", "collection": "collections"}
+
+
 def _copy_summary(summary: dict) -> str:
     """Human-readable outcome of a copy.
 
@@ -84,16 +95,23 @@ def _copy_summary(summary: dict) -> str:
     source URL) otherwise looks exactly like a successful one.
     """
     target = f'"{summary["target_database"]}" at {summary["target_endpoint"]}'
+    singular = summary.get("object_label", "table/view")
+    plural = _PLURALS.get(singular, f"{singular}s")
     if summary["source_objects"] == 0:
         return (
             "Copy complete, but nothing was copied: the source database "
-            "contains no tables. Check the database name in the source URL."
+            f"contains no {plural}. Check the database name in the source URL."
         )
     count = summary["target_objects"]
     if count is None:
         return f"Copy complete into {target}"
-    noun = "table/view" if count == 1 else "tables/views"
-    return f"Copy complete: {target} now holds {count} {noun}"
+    return f"Copy complete: {target} now holds {count} {singular if count == 1 else plural}"
+
+
+def _progress(line: str) -> None:
+    """Live progress sink. Only the MongoDB engine reports through it -- the
+    tool-based engines let pg_dump / mysqldump write their own to stderr."""
+    print(line, flush=True)
 
 
 def _confirm(prompt: str) -> bool:
@@ -123,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
                 create_target=not args.no_create,
                 overwrite=args.overwrite,
                 skip_missing_extensions=args.skip_missing_extensions,
+                progress=_progress,
             )
             print(_copy_summary(summary))
         elif args.command == "clean":

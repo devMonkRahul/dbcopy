@@ -10,9 +10,19 @@
 <body class="bg-slate-950 text-slate-200 min-h-screen flex justify-center px-4 py-10">
 
     <main class="w-full max-w-5xl">
-        <h1 class="text-3xl font-bold mb-1">
-            db<span class="text-blue-400">copy</span>
-        </h1>
+        <div class="flex items-baseline justify-between mb-1">
+            <h1 class="text-3xl font-bold">
+                db<span class="text-blue-400">copy</span>
+                <span class="text-slate-500 font-normal text-2xl">/ PostgreSQL &amp; MySQL</span>
+            </h1>
+
+            <a
+                href="/mongodb"
+                class="text-sm text-slate-400 hover:text-green-400 transition"
+            >
+                MongoDB copy &rarr;
+            </a>
+        </div>
 
         <div class="text-slate-400 mb-7">
             Full database copy — source → target. Client tools are managed
@@ -30,7 +40,7 @@
                     id="src"
                     type="text"
                     spellcheck="false"
-                    placeholder="postgresql:// | mysql:// | mongodb:// ...@host:5432/sourcedb"
+                    placeholder="postgresql:// | mysql:// ...@host:5432/sourcedb"
                     class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-blue-400"
                 />
 
@@ -61,7 +71,7 @@
                     id="dst"
                     type="text"
                     spellcheck="false"
-                    placeholder="postgresql:// | mysql:// | mongodb:// ...@host:5432/targetdb"
+                    placeholder="postgresql:// | mysql:// ...@host:5432/targetdb"
                     class="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-slate-200 font-mono text-sm focus:outline-none focus:border-blue-400"
                 />
 

@@ -1,16 +1,15 @@
 """Self-managed database client tools.
 
 dbcopy does NOT require the native client tools (pg_dump / psql for
-PostgreSQL, mongodump / mongorestore for MongoDB, mysqldump / mysql for
-MySQL) to be installed on the machine. Tools are resolved in this order:
+PostgreSQL, mysqldump / mysql for MySQL) to be installed on the machine.
+Tools are resolved in this order:
 
 1. A per-family override directory environment variable
-   (``DBCOPY_PG_BIN``, ``DBCOPY_MONGO_BIN``, ``DBCOPY_MYSQL_BIN``)
+   (``DBCOPY_PG_BIN``, ``DBCOPY_MYSQL_BIN``)
 2. A previously downloaded copy under ``~/.dbcopy/tools/``
 3. The system PATH (an existing install is happily reused)
 4. Auto-download of portable, self-contained binaries (cached for next time):
    - PostgreSQL: https://github.com/theseus-rs/postgresql-binaries
-   - MongoDB Database Tools: https://fastdl.mongodb.org/tools/db
    - MySQL Community archives: https://cdn.mysql.com
 
 Adding another engine is just a new ``_ToolFamily`` entry below.
@@ -59,9 +58,6 @@ PG_VERSIONS: dict[int, str] = {
     18: DEFAULT_PG_VERSION,
 }
 
-#: Release version of the MongoDB Database Tools bundle to download.
-DEFAULT_MONGO_TOOLS_VERSION = "100.10.0"
-
 #: Release version of the MySQL Community archive to download. MySQL does not
 #: publish a client-only bundle, so the full distribution is fetched and then
 #: stripped down to the client programs on install (see _ToolFamily.prune).
@@ -73,7 +69,6 @@ DEFAULT_MYSQL_VERSION = "8.4.11"
 _MYSQL_MACOS_BUILD = "macos15"
 
 _PG_DOWNLOAD_BASE = "https://github.com/theseus-rs/postgresql-binaries/releases/download"
-_MONGO_DOWNLOAD_BASE = "https://fastdl.mongodb.org/tools/db"
 #: MySQL assets are served straight from the CDN. The dev.mysql.com/get
 #: redirector is bot-protected and 403s any non-browser User-Agent, so it is
 #: deliberately not used. The CDN keeps the current release of a series under
@@ -125,40 +120,11 @@ def _pg_platform_token() -> str:
     )
 
 
-def _mongo_platform_token() -> str:
-    """Map this machine to a MongoDB Database Tools release token.
-
-    MongoDB names assets by OS (and Linux distro), not by rust triple:
-    ``windows-x86_64``, ``macos-arm64``, ``ubuntu2204-x86_64`` ... There is
-    no universal Linux build, so the distro defaults to ``ubuntu2204`` (glibc,
-    broadly compatible) and can be overridden with ``DBCOPY_MONGO_PLATFORM``
-    (e.g. ``rhel80``, ``amazon2023``, ``debian12``) for other distros.
-    """
-    system = platform.system()
-    machine = platform.machine().lower()
-    arch = {"x86_64": "x86_64", "amd64": "x86_64",
-            "aarch64": "arm64", "arm64": "arm64"}.get(machine)
-
-    if system == "Windows":
-        # Only x86_64 is published; ARM64 Windows runs it via emulation.
-        return "windows-x86_64"
-    if system == "Darwin":
-        return f"macos-{arch or 'x86_64'}"
-    if system == "Linux" and arch:
-        distro = os.environ.get("DBCOPY_MONGO_PLATFORM", "ubuntu2204")
-        return f"{distro}-{arch}"
-    raise RuntimeError(
-        f"No portable MongoDB Database Tools are available for {system}/{machine}. "
-        "Install the MongoDB Database Tools manually and either add them to "
-        "PATH or point DBCOPY_MONGO_BIN at their bin directory."
-    )
-
-
 def _mysql_platform_token() -> str:
     """Map this machine to the platform part of a MySQL archive name.
 
-    MySQL uses yet another naming scheme (neither a rust triple nor MongoDB's
-    OS token): assets are ``mysql-{version}-{token}.{ext}`` with tokens like
+    MySQL uses a naming scheme of its own (not the rust triple PostgreSQL
+    ships under): assets are ``mysql-{version}-{token}.{ext}`` with tokens like
     ``winx64``, ``linux-glibc2.28-x86_64-minimal`` or ``macos15-arm64``. The
     slimmer ``-minimal`` build (no test suite / debug binaries) is published
     only for Linux x86_64; elsewhere the full archive is the only choice.
@@ -230,12 +196,6 @@ class _ToolFamily:
     prune: _Prune | None = None
 
 
-def _mongo_asset_name(version: str, token: str) -> str:
-    # Windows/macOS ship .zip, Linux ships .tgz.
-    ext = "zip" if token.startswith(("windows", "macos")) else "tgz"
-    return f"mongodb-database-tools-{token}-{version}.{ext}"
-
-
 _PG = _ToolFamily(
     key="PostgreSQL",
     dirname="postgresql",
@@ -251,21 +211,6 @@ _PG = _ToolFamily(
         f"{_PG_DOWNLOAD_BASE}/{version}/postgresql-{version}-{token}.tar.gz"
     ),
 )
-
-_MONGO_TOOLS = _ToolFamily(
-    key="MongoDB Database Tools",
-    dirname="mongodb-database-tools",
-    version_env="DBCOPY_MONGO_VERSION",
-    default_version=DEFAULT_MONGO_TOOLS_VERSION,
-    bin_env="DBCOPY_MONGO_BIN",
-    marker="mongodump",
-    tools=("mongodump", "mongorestore"),
-    platform_token=_mongo_platform_token,
-    asset_name=_mongo_asset_name,
-    # fastdl layout: <base>/<asset>
-    asset_url=lambda version, token: f"{_MONGO_DOWNLOAD_BASE}/{_mongo_asset_name(version, token)}",
-)
-
 
 def _mysql_asset_name(version: str, token: str) -> str:
     # Windows ships .zip, macOS .tar.gz, Linux .tar.xz (tarfile sniffs both).
@@ -323,7 +268,7 @@ _MYSQL = _ToolFamily(
     ),
 )
 
-_TOOL_FAMILIES: tuple[_ToolFamily, ...] = (_PG, _MONGO_TOOLS, _MYSQL)
+_TOOL_FAMILIES: tuple[_ToolFamily, ...] = (_PG, _MYSQL)
 
 
 def pg_version_for_major(major: int) -> str:
